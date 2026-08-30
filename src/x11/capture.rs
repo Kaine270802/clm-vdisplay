@@ -226,13 +226,12 @@ impl X11CaptureEngine {
                                         let raw_slice = shm_segment.as_slice();
                                         {
                                             let mut fb = framebuffer.inner.write();
-                                            fb.update_rect(
+                                            fb.update_rect_from_full_frame(
                                                 dirty.min_x as u32,
                                                 dirty.min_y as u32,
                                                 dw,
                                                 dh,
                                                 raw_slice,
-                                                stride,
                                             );
                                         }
                                         framebuffer.notify_damage();

@@ -252,6 +252,26 @@ impl TileFramebuffer {
         }
     }
 
+    #[inline]
+    fn mark_tiles_dirty_in_region(&mut self, x: u32, y: u32, clamp_w: usize, clamp_h: usize) {
+        let tile_start_x = ((x as usize) / TILE_SIZE) as u32;
+        let tile_end_x =
+            (((x as usize + clamp_w - 1) / TILE_SIZE) as u32).min(self.tiles_x.saturating_sub(1));
+        let tile_start_y = ((y as usize) / TILE_SIZE) as u32;
+        let tile_end_y =
+            (((y as usize + clamp_h - 1) / TILE_SIZE) as u32).min(self.tiles_y.saturating_sub(1));
+
+        for ty in tile_start_y..=tile_end_y {
+            for tx in tile_start_x..=tile_end_x {
+                let idx = (ty * self.tiles_x + tx) as usize;
+                if idx < self.dirty_tiles.len() {
+                    self.dirty_tiles[idx] = true;
+                }
+            }
+        }
+        self.frame_version = self.frame_version.wrapping_add(1);
+    }
+
     /// Copy a rectangular image chunk into the framebuffer and mark corresponding tiles dirty
     pub fn update_rect(
         &mut self,
@@ -283,21 +303,37 @@ impl TileFramebuffer {
             }
         }
 
-        // Mark affected tiles as dirty
-        let tile_start_x = ((x as usize) / TILE_SIZE) as u32;
-        let tile_end_x = (((x as usize + clamp_w - 1) / TILE_SIZE) as u32).min(self.tiles_x.saturating_sub(1));
-        let tile_start_y = ((y as usize) / TILE_SIZE) as u32;
-        let tile_end_y = (((y as usize + clamp_h - 1) / TILE_SIZE) as u32).min(self.tiles_y.saturating_sub(1));
+        self.mark_tiles_dirty_in_region(x, y, clamp_w, clamp_h);
+    }
 
-        for ty in tile_start_y..=tile_end_y {
-            for tx in tile_start_x..=tile_end_x {
-                let idx = (ty * self.tiles_x + tx) as usize;
-                if idx < self.dirty_tiles.len() {
-                    self.dirty_tiles[idx] = true;
-                }
+    /// Copy a damaged sub-rectangle from a full-frame buffer (e.g. MIT-SHM capture)
+    pub fn update_rect_from_full_frame(
+        &mut self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        full_frame: &[u8],
+    ) {
+        if x >= self.width || y >= self.height || w == 0 || h == 0 {
+            return;
+        }
+        let clamp_w = (w).min(self.width - x) as usize;
+        let clamp_h = (h).min(self.height - y) as usize;
+        let bytes_per_pixel = 4;
+        let row_bytes = clamp_w * bytes_per_pixel;
+
+        for row in 0..clamp_h {
+            let cur_y = (y as usize) + row;
+            let offset = cur_y * self.stride + (x as usize) * bytes_per_pixel;
+            let end = offset + row_bytes;
+
+            if end <= full_frame.len() && end <= self.buffer.len() {
+                self.buffer[offset..end].copy_from_slice(&full_frame[offset..end]);
             }
         }
-        self.frame_version = self.frame_version.wrapping_add(1);
+
+        self.mark_tiles_dirty_in_region(x, y, clamp_w, clamp_h);
     }
 
     /// Mark all tiles as dirty (full screen refresh)
@@ -401,36 +437,26 @@ impl TileFramebuffer {
                                 for col in 0..copy_w {
                                     let s = col * 4;
                                     let d = col * 4;
-                                    let b = src_row[s];
-                                    let g = src_row[s + 1];
-                                    let r = src_row[s + 2];
-                                    let a = src_row[s + 3];
-                                    dst_row[d] = r;
-                                    dst_row[d + 1] = g;
-                                    dst_row[d + 2] = b;
-                                    dst_row[d + 3] = a;
+                                    dst_row[d] = src_row[s + 2]; // R
+                                    dst_row[d + 1] = src_row[s + 1]; // G
+                                    dst_row[d + 2] = src_row[s]; // B
+                                    dst_row[d + 3] = src_row[s + 3]; // A
                                 }
                             } else if is_rgb24 {
                                 for col in 0..copy_w {
                                     let s = col * 4;
                                     let d = col * 3;
-                                    let b = src_row[s];
-                                    let g = src_row[s + 1];
-                                    let r = src_row[s + 2];
-                                    dst_row[d] = r;
-                                    dst_row[d + 1] = g;
-                                    dst_row[d + 2] = b;
+                                    dst_row[d] = src_row[s + 2]; // R
+                                    dst_row[d + 1] = src_row[s + 1]; // G
+                                    dst_row[d + 2] = src_row[s]; // B
                                 }
                             } else if is_bgr24 {
                                 for col in 0..copy_w {
                                     let s = col * 4;
                                     let d = col * 3;
-                                    let b = src_row[s];
-                                    let g = src_row[s + 1];
-                                    let r = src_row[s + 2];
-                                    dst_row[d] = b;
-                                    dst_row[d + 1] = g;
-                                    dst_row[d + 2] = r;
+                                    dst_row[d] = src_row[s]; // B
+                                    dst_row[d + 1] = src_row[s + 1]; // G
+                                    dst_row[d + 2] = src_row[s + 2]; // R
                                 }
                             } else if bpp == 2 {
                                 for col in 0..copy_w {
@@ -449,25 +475,44 @@ impl TileFramebuffer {
                                         dst_row[d..d + 2].copy_from_slice(&pixel16.to_le_bytes());
                                     }
                                 }
+                            } else if bpp == 1 {
+                                for col in 0..copy_w {
+                                    let s = col * 4;
+                                    let d = col;
+                                    let b = src_row[s] as u16;
+                                    let g = src_row[s + 1] as u16;
+                                    let r = src_row[s + 2] as u16;
+                                    let r_val = ((r * target_format.red_max) / 255) << target_format.red_shift;
+                                    let g_val = ((g * target_format.green_max) / 255) << target_format.green_shift;
+                                    let b_val = ((b * target_format.blue_max) / 255) << target_format.blue_shift;
+                                    dst_row[d] = (r_val | g_val | b_val) as u8;
+                                }
                             } else {
                                 for col in 0..copy_w {
                                     let s = col * 4;
                                     let d = col * bpp;
-                                    let b = src_row[s];
-                                    let g = src_row[s + 1];
-                                    let r = src_row[s + 2];
-                                    let a = src_row[s + 3];
+                                    let b = src_row[s] as u32;
+                                    let g = src_row[s + 1] as u32;
+                                    let r = src_row[s + 2] as u32;
+                                    let r_val = ((r * target_format.red_max as u32) / 255) << target_format.red_shift;
+                                    let g_val = ((g * target_format.green_max as u32) / 255) << target_format.green_shift;
+                                    let b_val = ((b * target_format.blue_max as u32) / 255) << target_format.blue_shift;
+                                    let pixel32 = r_val | g_val | b_val;
                                     if bpp == 4 {
-                                        dst_row[d] = r;
-                                        dst_row[d + 1] = g;
-                                        dst_row[d + 2] = b;
-                                        dst_row[d + 3] = a;
-                                    } else if bpp == 3 {
-                                        dst_row[d] = r;
-                                        dst_row[d + 1] = g;
-                                        dst_row[d + 2] = b;
+                                        if target_format.big_endian_flag != 0 {
+                                            dst_row[d..d + 4].copy_from_slice(&pixel32.to_be_bytes());
+                                        } else {
+                                            dst_row[d..d + 4].copy_from_slice(&pixel32.to_le_bytes());
+                                        }
+                                    } else {
+                                        for bi in 0..bpp.min(4) {
+                                            dst_row[d + bi] = (pixel32 >> (bi * 8)) as u8;
+                                        }
                                     }
                                 }
+                            }
+                            if copy_w < rw {
+                                dst_row[copy_w * bpp..dst_stride].fill(0);
                             }
                         }
                     }
@@ -530,25 +575,44 @@ impl TileFramebuffer {
                                     dst_row[d..d + 2].copy_from_slice(&pixel16.to_le_bytes());
                                 }
                             }
+                        } else if bpp == 1 {
+                            for col in 0..copy_w {
+                                let s = col * 4;
+                                let d = col;
+                                let b = src_row[s] as u16;
+                                let g = src_row[s + 1] as u16;
+                                let r = src_row[s + 2] as u16;
+                                let r_val = ((r * target_format.red_max) / 255) << target_format.red_shift;
+                                let g_val = ((g * target_format.green_max) / 255) << target_format.green_shift;
+                                let b_val = ((b * target_format.blue_max) / 255) << target_format.blue_shift;
+                                dst_row[d] = (r_val | g_val | b_val) as u8;
+                            }
                         } else {
                             for col in 0..copy_w {
                                 let s = col * 4;
                                 let d = col * bpp;
-                                let b = src_row[s];
-                                let g = src_row[s + 1];
-                                let r = src_row[s + 2];
-                                let a = src_row[s + 3];
+                                let b = src_row[s] as u32;
+                                let g = src_row[s + 1] as u32;
+                                let r = src_row[s + 2] as u32;
+                                let r_val = ((r * target_format.red_max as u32) / 255) << target_format.red_shift;
+                                let g_val = ((g * target_format.green_max as u32) / 255) << target_format.green_shift;
+                                let b_val = ((b * target_format.blue_max as u32) / 255) << target_format.blue_shift;
+                                let pixel32 = r_val | g_val | b_val;
                                 if bpp == 4 {
-                                    dst_row[d] = r;
-                                    dst_row[d + 1] = g;
-                                    dst_row[d + 2] = b;
-                                    dst_row[d + 3] = a;
-                                } else if bpp == 3 {
-                                    dst_row[d] = r;
-                                    dst_row[d + 1] = g;
-                                    dst_row[d + 2] = b;
+                                    if target_format.big_endian_flag != 0 {
+                                        dst_row[d..d + 4].copy_from_slice(&pixel32.to_be_bytes());
+                                    } else {
+                                        dst_row[d..d + 4].copy_from_slice(&pixel32.to_le_bytes());
+                                    }
+                                } else {
+                                    for bi in 0..bpp.min(4) {
+                                        dst_row[d + bi] = (pixel32 >> (bi * 8)) as u8;
+                                    }
                                 }
                             }
+                        }
+                        if copy_w < rw {
+                            dst_row[copy_w * bpp..dst_stride].fill(0);
                         }
                     }
                 }
@@ -716,6 +780,63 @@ mod tests {
         let extracted_be = fb.extract_rect_bytes(&rect, &rgb565);
         let pixel_val_be = u16::from_be_bytes([extracted_be[0], extracted_be[1]]);
         assert_eq!(pixel_val_be, 0x07E0);
+    }
+
+    #[test]
+    fn test_update_rect_from_full_frame_non_zero_coordinates() {
+        let mut fb = TileFramebuffer::new(128, 128);
+        // Create full-frame pattern where pixel (x, y) = (x as u8, y as u8, 0x55, 0xFF)
+        let mut full_frame = vec![0u8; 128 * 128 * 4];
+        for y in 0..128 {
+            for x in 0..128 {
+                let idx = (y * 128 + x) * 4;
+                full_frame[idx] = x as u8; // B
+                full_frame[idx + 1] = y as u8; // G
+                full_frame[idx + 2] = 0x55; // R
+                full_frame[idx + 3] = 0xFF; // A
+            }
+        }
+
+        // Damage sub-region at x=64, y=64, w=32, h=32
+        fb.update_rect_from_full_frame(64, 64, 32, 32, &full_frame);
+
+        // Verify tile damage tracking marked tile (1, 1) dirty
+        let damaged = fb.detect_damage_tiles();
+        assert!(damaged.contains(&Rect::new(64, 64, 64, 64)));
+
+        // Verify pixel data inside framebuffer at (64, 64) matches pattern
+        let rect = Rect::new(64, 64, 2, 2);
+        let extracted = fb.extract_rect_bytes(&rect, &PixelFormat::bgra32());
+        assert_eq!(&extracted[0..4], &[64, 64, 0x55, 0xFF]);
+        assert_eq!(&extracted[4..8], &[65, 64, 0x55, 0xFF]);
+    }
+
+    #[test]
+    fn test_extract_rect_8bit_true_colour() {
+        let mut fb = TileFramebuffer::new(64, 64);
+        // BGRA format: B=0, G=0, R=255, A=255 -> Pure Red
+        let pixel = [0u8, 0, 255, 255];
+        let patch: Vec<u8> = pixel.iter().cycle().take(64 * 64 * 4).copied().collect();
+        fb.update_rect(0, 0, 64, 64, &patch, 64 * 4);
+
+        let rgb332 = PixelFormat {
+            bits_per_pixel: 8,
+            depth: 8,
+            big_endian_flag: 0,
+            true_colour_flag: 1,
+            red_max: 7,
+            green_max: 7,
+            blue_max: 3,
+            red_shift: 5,
+            green_shift: 2,
+            blue_shift: 0,
+        };
+
+        let rect = Rect::new(0, 0, 2, 2);
+        let extracted = fb.extract_rect_bytes(&rect, &rgb332);
+        assert_eq!(extracted.len(), 2 * 2); // 4 bytes
+        // Pure Red: red_max (7) << 5 = 0b1110_0000 = 224
+        assert_eq!(extracted[0], 224);
     }
 }
 

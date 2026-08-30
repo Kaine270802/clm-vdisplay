@@ -210,6 +210,27 @@ pub fn encode_pseudo_cursor(
                     color_data[out_idx] = r;
                     color_data[out_idx + 1] = g;
                     color_data[out_idx + 2] = b;
+                } else if bpp == 2 {
+                    let r_val =
+                        ((r as u16 * client_format.red_max) / 255) << client_format.red_shift;
+                    let g_val =
+                        ((g as u16 * client_format.green_max) / 255) << client_format.green_shift;
+                    let b_val =
+                        ((b as u16 * client_format.blue_max) / 255) << client_format.blue_shift;
+                    let pixel16 = r_val | g_val | b_val;
+                    if client_format.big_endian_flag != 0 {
+                        color_data[out_idx..out_idx + 2].copy_from_slice(&pixel16.to_be_bytes());
+                    } else {
+                        color_data[out_idx..out_idx + 2].copy_from_slice(&pixel16.to_le_bytes());
+                    }
+                } else if bpp == 1 {
+                    let r_val =
+                        ((r as u16 * client_format.red_max) / 255) << client_format.red_shift;
+                    let g_val =
+                        ((g as u16 * client_format.green_max) / 255) << client_format.green_shift;
+                    let b_val =
+                        ((b as u16 * client_format.blue_max) / 255) << client_format.blue_shift;
+                    color_data[out_idx] = (r_val | g_val | b_val) as u8;
                 }
 
                 if a > 128 {
@@ -409,6 +430,41 @@ mod tests {
         assert_eq!(header.encoding, PSEUDO_ENCODING_CURSOR);
         assert_eq!(header.rect.width, 1);
         assert_eq!(header.rect.height, 1);
+    }
+
+    #[test]
+    fn test_encode_pseudo_cursor_empty_and_16bit() {
+        let mut buf = BytesMut::new();
+        let rgba = vec![255u8, 0, 0, 255];
+        let rgb565 = PixelFormat {
+            bits_per_pixel: 16,
+            depth: 16,
+            big_endian_flag: 0,
+            true_colour_flag: 1,
+            red_max: 31,
+            green_max: 63,
+            blue_max: 31,
+            red_shift: 11,
+            green_shift: 5,
+            blue_shift: 0,
+        };
+
+        // 16-bit format cursor
+        encode_pseudo_cursor(2, 3, 1, 1, &rgba, &rgb565, &mut buf);
+        assert_eq!(buf.len(), 12 + 2 + 1); // 12 header + 2 bytes color + 1 byte mask
+        let header = UpdateRectHeader::parse(&buf[..12]).unwrap();
+        assert_eq!(header.rect.x, 2);
+        assert_eq!(header.rect.y, 3);
+        assert_eq!(header.rect.width, 1);
+        assert_eq!(header.rect.height, 1);
+
+        // Empty cursor (width = 0, height = 0)
+        buf.clear();
+        encode_pseudo_cursor(0, 0, 0, 0, &[], &rgb565, &mut buf);
+        assert_eq!(buf.len(), 12);
+        let header_empty = UpdateRectHeader::parse(&buf[..12]).unwrap();
+        assert_eq!(header_empty.rect.width, 0);
+        assert_eq!(header_empty.rect.height, 0);
     }
 }
 
