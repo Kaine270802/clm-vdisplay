@@ -1,0 +1,13 @@
+target/
+**/*.rs.bk
+*.log
+.env
+.credentials.json
+.claude*
+.gemini*
+.hermes*
+.opencode*
+.grok*
+.antigravity*
+.copilot*
+.codex*

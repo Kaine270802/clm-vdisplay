@@ -1,0 +1,62 @@
+[package]
+name = "clm-vdisplay"
+version = "0.1.0"
+edition = "2021"
+authors = ["CloakBrowser Core Team"]
+description = "High-Performance Hybrid Virtual Display & VNC/WebRTC Streaming Engine in Rust"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "clm_vdisplay"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "clm-vdisplay"
+path = "src/main.rs"
+
+[[bench]]
+name = "encoding_bench"
+harness = false
+
+[dependencies]
+# Async Runtime & Networking
+tokio = { version = "1.38", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+tokio-tungstenite = "0.23"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std", "async-await"] }
+bytes = "1.6"
+parking_lot = "0.12"
+
+# CLI & Configuration
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging & Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error Handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Image Processing, Compression & SIMD
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+flate2 = "1.0"
+zune-jpeg = "0.4"
+rayon = "1.10"
+
+# Python C-FFI / PyO3 (Optional / Feature Gated)
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py310"], optional = true }
+
+[features]
+default = ["wayland-mode", "x11-mode"]
+wayland-mode = []
+x11-mode = []
+webrtc = []
+python = ["dep:pyo3"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+criterion = { version = "0.5", features = ["async_tokio"] }
+rand = "0.8"
