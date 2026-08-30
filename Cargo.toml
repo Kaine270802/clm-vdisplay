@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 
 [lib]
 name = "clm_vdisplay"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [[bin]]
 name = "clm-vdisplay"
@@ -46,8 +46,8 @@ flate2 = "1.0"
 zune-jpeg = "0.4"
 rayon = "1.10"
 
-# X11, MIT-SHM, XDamage, SysV & POSIX Process Lifecycle
-x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "randr", "xtest", "allow-unsafe-code"] }
+# X11, MIT-SHM, XDamage, SysV & POSIX Process Lifecycle (Pure Rust x11rb)
+x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "randr", "xtest"] }
 libc = "0.2"
 nix = { version = "0.29", features = ["signal", "process"] }
 
