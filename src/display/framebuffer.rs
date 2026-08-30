@@ -147,8 +147,8 @@ impl Rect {
     pub fn intersection(&self, other: &Rect) -> Option<Rect> {
         let x1 = self.x.max(other.x);
         let y1 = self.y.max(other.y);
-        let x2 = (self.x + self.width).min(other.x + other.width);
-        let y2 = (self.y + self.height).min(other.y + other.height);
+        let x2 = (self.x.saturating_add(self.width)).min(other.x.saturating_add(other.width));
+        let y2 = (self.y.saturating_add(self.height)).min(other.y.saturating_add(other.height));
         if x2 > x1 && y2 > y1 {
             Some(Rect::new(x1, y1, x2 - x1, y2 - y1))
         } else {
@@ -364,6 +364,9 @@ impl TileFramebuffer {
         let rw = rect.width as usize;
         let rh = rect.height as usize;
         let bpp = (target_format.bits_per_pixel / 8) as usize;
+        if rw == 0 || rh == 0 || bpp == 0 {
+            return;
+        }
         let dst_stride = rw * bpp;
 
         let is_bgra = target_format.bits_per_pixel == 32
@@ -429,6 +432,23 @@ impl TileFramebuffer {
                                     dst_row[d + 1] = g;
                                     dst_row[d + 2] = r;
                                 }
+                            } else if bpp == 2 {
+                                for col in 0..copy_w {
+                                    let s = col * 4;
+                                    let d = col * 2;
+                                    let b = src_row[s] as u16;
+                                    let g = src_row[s + 1] as u16;
+                                    let r = src_row[s + 2] as u16;
+                                    let r_val = ((r * target_format.red_max) / 255) << target_format.red_shift;
+                                    let g_val = ((g * target_format.green_max) / 255) << target_format.green_shift;
+                                    let b_val = ((b * target_format.blue_max) / 255) << target_format.blue_shift;
+                                    let pixel16 = r_val | g_val | b_val;
+                                    if target_format.big_endian_flag != 0 {
+                                        dst_row[d..d + 2].copy_from_slice(&pixel16.to_be_bytes());
+                                    } else {
+                                        dst_row[d..d + 2].copy_from_slice(&pixel16.to_le_bytes());
+                                    }
+                                }
                             } else {
                                 for col in 0..copy_w {
                                     let s = col * 4;
@@ -492,6 +512,23 @@ impl TileFramebuffer {
                                 dst_row[d] = src_row[s]; // B
                                 dst_row[d + 1] = src_row[s + 1]; // G
                                 dst_row[d + 2] = src_row[s + 2]; // R
+                            }
+                        } else if bpp == 2 {
+                            for col in 0..copy_w {
+                                let s = col * 4;
+                                let d = col * 2;
+                                let b = src_row[s] as u16;
+                                let g = src_row[s + 1] as u16;
+                                let r = src_row[s + 2] as u16;
+                                let r_val = ((r * target_format.red_max) / 255) << target_format.red_shift;
+                                let g_val = ((g * target_format.green_max) / 255) << target_format.green_shift;
+                                let b_val = ((b * target_format.blue_max) / 255) << target_format.blue_shift;
+                                let pixel16 = r_val | g_val | b_val;
+                                if target_format.big_endian_flag != 0 {
+                                    dst_row[d..d + 2].copy_from_slice(&pixel16.to_be_bytes());
+                                } else {
+                                    dst_row[d..d + 2].copy_from_slice(&pixel16.to_le_bytes());
+                                }
                             }
                         } else {
                             for col in 0..copy_w {
@@ -614,6 +651,71 @@ mod tests {
         // In RGB24: R=30, G=20, B=10
         assert_eq!(&extracted[0..3], &[30, 20, 10]);
         assert_eq!(&extracted[3..6], &[30, 20, 10]);
+    }
+
+    #[test]
+    fn test_rect_intersection_overflow_boundary() {
+        let r1 = Rect::new(0, 0, 100, 100);
+        let r2 = Rect::new(u16::MAX - 50, u16::MAX - 50, 100, 100);
+        // Ensure saturating arithmetic does not panic on integer overflow
+        assert!(!r1.intersects(&r2));
+        assert_eq!(r1.intersection(&r2), None);
+
+        let r3 = Rect::new(u16::MAX - 20, u16::MAX - 20, 50, 50);
+        let r4 = Rect::new(u16::MAX - 10, u16::MAX - 10, 50, 50);
+        let inter = r3.intersection(&r4).expect("intersection expected");
+        assert_eq!(inter.x, u16::MAX - 10);
+        assert_eq!(inter.y, u16::MAX - 10);
+        assert_eq!(inter.width, 10);
+        assert_eq!(inter.height, 10);
+    }
+
+    #[test]
+    fn test_extract_rect_zero_dimensions_no_panic() {
+        let fb = TileFramebuffer::new(64, 64);
+        let mut out = vec![0u8; 100];
+        let rect = Rect::new(0, 0, 0, 0);
+        let format = PixelFormat::bgra32();
+        fb.extract_rect_bytes_into(&rect, &format, &mut out);
+
+        let mut invalid_fmt = format;
+        invalid_fmt.bits_per_pixel = 0;
+        let rect2 = Rect::new(0, 0, 64, 64);
+        fb.extract_rect_bytes_into(&rect2, &invalid_fmt, &mut out);
+    }
+
+    #[test]
+    fn test_extract_rect_16bit_rgb565() {
+        let mut fb = TileFramebuffer::new(64, 64);
+        // BGRA format: B=0, G=255, R=0, A=255 -> Pure Green
+        let pixel = [0u8, 255, 0, 255];
+        let patch: Vec<u8> = pixel.iter().cycle().take(64 * 64 * 4).copied().collect();
+        fb.update_rect(0, 0, 64, 64, &patch, 64 * 4);
+
+        let mut rgb565 = PixelFormat {
+            bits_per_pixel: 16,
+            depth: 16,
+            big_endian_flag: 0,
+            true_colour_flag: 1,
+            red_max: 31,
+            green_max: 63,
+            blue_max: 31,
+            red_shift: 11,
+            green_shift: 5,
+            blue_shift: 0,
+        };
+        let rect = Rect::new(0, 0, 2, 2);
+        let extracted = fb.extract_rect_bytes(&rect, &rgb565);
+        assert_eq!(extracted.len(), 2 * 2 * 2); // 8 bytes
+        let pixel_val = u16::from_le_bytes([extracted[0], extracted[1]]);
+        // Green component: 63 << 5 = 0x07E0 = 2016
+        assert_eq!(pixel_val, 0x07E0);
+
+        // Test Big-Endian 16-bit
+        rgb565.big_endian_flag = 1;
+        let extracted_be = fb.extract_rect_bytes(&rect, &rgb565);
+        let pixel_val_be = u16::from_be_bytes([extracted_be[0], extracted_be[1]]);
+        assert_eq!(pixel_val_be, 0x07E0);
     }
 }
 

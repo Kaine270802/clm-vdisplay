@@ -197,10 +197,13 @@ impl RfbProtocolEngine {
         let mut supports_tight = false;
         let mut supports_zrle = false;
         let mut supports_last_rect = false;
-        let mut _supports_desktop_size = false;
+        let mut supports_desktop_size = false;
         let mut _supports_desktop_name = false;
         let mut _supports_cursor = false;
         let mut continuous_updates = false;
+
+        let mut client_width = width;
+        let mut client_height = height;
 
         let mut send_buf = BytesMut::with_capacity(65536);
         let mut damage_rx = self.framebuffer.notify_rx.clone();
@@ -230,7 +233,7 @@ impl RfbProtocolEngine {
                                 supports_tight = encs.contains(&ENCODING_TIGHT);
                                 supports_zrle = encs.contains(&ENCODING_ZRLE);
                                 supports_last_rect = encs.contains(&PSEUDO_ENCODING_LAST_RECT);
-                                _supports_desktop_size = encs.contains(&PSEUDO_ENCODING_DESKTOP_SIZE);
+                                supports_desktop_size = encs.contains(&PSEUDO_ENCODING_DESKTOP_SIZE);
                                 _supports_desktop_name = encs.contains(&PSEUDO_ENCODING_DESKTOP_NAME);
                                 _supports_cursor = encs.contains(&PSEUDO_ENCODING_CURSOR);
                                 _client_encodings = encs;
@@ -245,6 +248,9 @@ impl RfbProtocolEngine {
                                         supports_tight,
                                         supports_zrle,
                                         supports_last_rect,
+                                        supports_desktop_size,
+                                        &mut client_width,
+                                        &mut client_height,
                                         Some(rect),
                                         false,
                                         &self.metrics,
@@ -260,6 +266,9 @@ impl RfbProtocolEngine {
                                         supports_tight,
                                         supports_zrle,
                                         supports_last_rect,
+                                        supports_desktop_size,
+                                        &mut client_width,
+                                        &mut client_height,
                                         Some(rect),
                                         true,
                                         &self.metrics,
@@ -300,6 +309,9 @@ impl RfbProtocolEngine {
                             supports_tight,
                             supports_zrle,
                             supports_last_rect,
+                            supports_desktop_size,
+                            &mut client_width,
+                            &mut client_height,
                             target_rect,
                             true,
                             &self.metrics,
@@ -333,6 +345,9 @@ async fn send_framebuffer_update_stream(
     _supports_tight: bool,
     _supports_zrle: bool,
     supports_last_rect: bool,
+    supports_desktop_size: bool,
+    client_width: &mut u16,
+    client_height: &mut u16,
     target_rect: Option<Rect>,
     incremental: bool,
     metrics: &MetricsRegistry,
@@ -340,13 +355,20 @@ async fn send_framebuffer_update_stream(
     send_buf.clear();
     let start_time = Instant::now();
 
-    let damaged_rects = {
+    let (current_width, current_height, damaged_rects) = {
         let mut fb = framebuffer.inner.write();
-        if !incremental {
+        let cur_w = fb.width as u16;
+        let cur_h = fb.height as u16;
+        if cur_w != *client_width || cur_h != *client_height {
+            fb.mark_all_damaged();
+        } else if !incremental {
             fb.mark_all_damaged();
         }
-        fb.detect_damage_tiles()
+        (cur_w, cur_h, fb.detect_damage_tiles())
     };
+
+    let size_changed =
+        (current_width != *client_width || current_height != *client_height) && supports_desktop_size;
 
     let filtered_rects: Vec<Rect> = if let Some(req) = target_rect {
         damaged_rects
@@ -357,7 +379,7 @@ async fn send_framebuffer_update_stream(
         damaged_rects
     };
 
-    if filtered_rects.is_empty() {
+    if filtered_rects.is_empty() && !size_changed {
         return Ok(false);
     }
 
@@ -365,10 +387,18 @@ async fn send_framebuffer_update_stream(
 
     {
         let fb_guard = framebuffer.inner.read();
-        let num_rects = filtered_rects.len() + if supports_last_rect { 1 } else { 0 };
+        let num_rects = filtered_rects.len()
+            + if size_changed { 1 } else { 0 }
+            + if supports_last_rect { 1 } else { 0 };
 
         send_buf.extend_from_slice(&[SERVER_MSG_FRAMEBUFFER_UPDATE, 0]);
-        send_buf.extend_from_slice(&(num_rects as u16).to_be_bytes());
+        send_buf.extend_from_slice(&(num_rects.min(65535) as u16).to_be_bytes());
+
+        if size_changed {
+            encode_pseudo_desktop_size(current_width, current_height, send_buf);
+            *client_width = current_width;
+            *client_height = current_height;
+        }
 
         for rect in &filtered_rects {
             // Default to high-performance RAW stream with tile damage tracking:
@@ -388,4 +418,124 @@ async fn send_framebuffer_update_stream(
     metrics.record_frame_update(rects_count, bytes_len, duration_us);
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn test_send_framebuffer_update_stream_raw_and_desktop_size() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            socket
+        });
+
+        let mut client_socket = TcpStream::connect(addr).await.unwrap();
+        let server_socket = client_handle.await.unwrap();
+
+        let mut transport = RfbTransport::Tcp(server_socket);
+        let mut send_buf = BytesMut::with_capacity(65536);
+        let fb = SharedFramebuffer::new(128, 128);
+        let format = PixelFormat::bgra32();
+        let metrics = MetricsRegistry::new();
+
+        let mut client_w = 128;
+        let mut client_h = 128;
+
+        // 1. Send full initial update (non-incremental) with LastRect
+        let sent = send_framebuffer_update_stream(
+            &mut transport,
+            &mut send_buf,
+            &fb,
+            &format,
+            false,
+            false,
+            true, // LastRect
+            true, // DesktopSize
+            &mut client_w,
+            &mut client_h,
+            None,
+            false,
+            &metrics,
+        )
+        .await
+        .unwrap();
+
+        assert!(sent);
+
+        // Read and verify message from client_socket
+        let mut recv_buf = vec![0u8; send_buf.len()];
+        client_socket.read_exact(&mut recv_buf).await.unwrap();
+
+        assert_eq!(recv_buf[0], SERVER_MSG_FRAMEBUFFER_UPDATE);
+        assert_eq!(recv_buf[1], 0); // pad
+        // 4 tiles (128x128 = 2x2 of 64x64) + 1 LastRect = 5 rects
+        let num_rects = u16::from_be_bytes([recv_buf[2], recv_buf[3]]);
+        assert_eq!(num_rects, 5);
+
+        // 2. Incremental update with no changes -> returns false
+        let sent_no_change = send_framebuffer_update_stream(
+            &mut transport,
+            &mut send_buf,
+            &fb,
+            &format,
+            false,
+            false,
+            true,
+            true,
+            &mut client_w,
+            &mut client_h,
+            None,
+            true,
+            &metrics,
+        )
+        .await
+        .unwrap();
+
+        assert!(!sent_no_change);
+
+        // 3. Resize framebuffer to 192x128 -> triggers DesktopSize pseudo-encoding
+        {
+            let mut fb_guard = fb.inner.write();
+            fb_guard.resize(192, 128);
+        }
+        fb.notify_damage();
+
+        let sent_resize = send_framebuffer_update_stream(
+            &mut transport,
+            &mut send_buf,
+            &fb,
+            &format,
+            false,
+            false,
+            true,
+            true, // supports DesktopSize
+            &mut client_w,
+            &mut client_h,
+            None,
+            true,
+            &metrics,
+        )
+        .await
+        .unwrap();
+
+        assert!(sent_resize);
+        assert_eq!(client_w, 192);
+        assert_eq!(client_h, 128);
+
+        let mut recv_buf2 = vec![0u8; send_buf.len()];
+        client_socket.read_exact(&mut recv_buf2).await.unwrap();
+        assert_eq!(recv_buf2[0], SERVER_MSG_FRAMEBUFFER_UPDATE);
+
+        // First rect must be DesktopSize pseudo-encoding (12 bytes at offset 4)
+        let header_ds = UpdateRectHeader::parse(&recv_buf2[4..16]).unwrap();
+        assert_eq!(header_ds.rect, Rect::new(0, 0, 192, 128));
+        assert_eq!(header_ds.encoding, PSEUDO_ENCODING_DESKTOP_SIZE);
+    }
 }

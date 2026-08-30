@@ -67,14 +67,21 @@ pub fn encode_tight_rect(
     client_format: &PixelFormat,
     buf: &mut BytesMut,
 ) {
-    let pixel_data = fb.extract_rect_bytes(rect, client_format);
-    let bpp = (client_format.bits_per_pixel / 8) as usize;
-
     let header = UpdateRectHeader::new(*rect, ENCODING_TIGHT);
     header.write_to(buf);
 
+    let bpp = (client_format.bits_per_pixel / 8) as usize;
+    // For TrueColour with depth 24 (both 24-bit and 32-bit bpp), Tight specification mandates 3 bytes per pixel (RGB24)
+    let is_truecolour24 = client_format.depth == 24 && (bpp == 3 || bpp == 4);
+    let pixel_data = if is_truecolour24 {
+        fb.extract_rect_bytes(rect, &PixelFormat::rgb24())
+    } else {
+        fb.extract_rect_bytes(rect, client_format)
+    };
+    let tight_bpp = if is_truecolour24 { 3 } else { bpp.max(1) };
+
     // 1. Check for Solid Fill (1 pixel color)
-    if let Some(solid_pixel) = get_solid_color_slice(&pixel_data, bpp) {
+    if let Some(solid_pixel) = get_solid_color_slice(&pixel_data, tight_bpp) {
         buf.put_u8(0x80); // 0x80: Fill compression type, stream 0
         buf.extend_from_slice(solid_pixel);
         return;
@@ -94,12 +101,10 @@ pub fn encode_tight_rect(
     );
     if encoder.write_all(&pixel_data).is_ok() {
         if let Ok(compressed) = encoder.finish() {
-            if compressed.len() < pixel_data.len() {
-                buf.put_u8(0x01); // comp-ctl: stream 0, reset bit (0x01)
-                write_compact_len(buf, compressed.len());
-                buf.extend_from_slice(&compressed);
-                return;
-            }
+            buf.put_u8(0x01); // comp-ctl: stream 0, reset bit (0x01)
+            write_compact_len(buf, compressed.len());
+            buf.extend_from_slice(&compressed);
+            return;
         }
     }
 
@@ -290,13 +295,13 @@ mod tests {
 
         // Header: 12 bytes
         // Solid fill flag: 1 byte (0x80)
-        // Solid pixel (BGRA): 4 bytes (0, 0, 0, 0)
-        assert_eq!(buf.len(), 12 + 1 + 4);
+        // Solid pixel (RGB24 for depth 24): 3 bytes (0, 0, 0)
+        assert_eq!(buf.len(), 12 + 1 + 3);
 
         let header = UpdateRectHeader::parse(&buf[..12]).expect("parsed header");
         assert_eq!(header.encoding, ENCODING_TIGHT);
         assert_eq!(buf[12], 0x80); // Fill
-        assert_eq!(&buf[13..17], &[0, 0, 0, 0]);
+        assert_eq!(&buf[13..16], &[0, 0, 0]);
     }
 
     #[test]
@@ -326,6 +331,84 @@ mod tests {
         assert_eq!(h_dn.encoding, PSEUDO_ENCODING_DESKTOP_NAME);
         assert_eq!(&buf[12..16], &9u32.to_be_bytes());
         assert_eq!(&buf[16..], b"MyDesktop");
+    }
+
+    #[test]
+    fn test_encode_tight_rect_zlib_compression_and_decompression() {
+        use flate2::read::ZlibDecoder;
+        use std::io::Read;
+
+        let mut fb = TileFramebuffer::new(64, 64);
+        // Create non-solid gradient data
+        let mut patch = vec![0u8; 64 * 64 * 4];
+        for y in 0..64 {
+            for x in 0..64 {
+                let idx = (y * 64 + x) * 4;
+                patch[idx] = (x * 4) as u8; // B
+                patch[idx + 1] = (y * 4) as u8; // G
+                patch[idx + 2] = ((x + y) * 2) as u8; // R
+                patch[idx + 3] = 255; // A
+            }
+        }
+        fb.update_rect(0, 0, 64, 64, &patch, 64 * 4);
+
+        let mut buf = BytesMut::new();
+        let format = PixelFormat::bgra32();
+        let rect = Rect::new(0, 0, 64, 64);
+
+        encode_tight_rect(&fb, &rect, &format, &mut buf);
+
+        // Header: 12 bytes
+        let header = UpdateRectHeader::parse(&buf[..12]).expect("parsed header");
+        assert_eq!(header.rect, rect);
+        assert_eq!(header.encoding, ENCODING_TIGHT);
+
+        // comp_ctl: 0x01 (stream 0, reset flag)
+        assert_eq!(buf[12], 0x01);
+
+        // Read compact length
+        let mut offset = 13;
+        let b0 = buf[offset] as usize;
+        offset += 1;
+        let compressed_len = if b0 & 0x80 == 0 {
+            b0
+        } else {
+            let b1 = buf[offset] as usize;
+            offset += 1;
+            if b1 & 0x80 == 0 {
+                (b0 & 0x7F) | (b1 << 7)
+            } else {
+                let b2 = buf[offset] as usize;
+                offset += 1;
+                (b0 & 0x7F) | ((b1 & 0x7F) << 7) | (b2 << 14)
+            }
+        };
+
+        let compressed_bytes = &buf[offset..offset + compressed_len];
+        let mut decoder = ZlibDecoder::new(compressed_bytes);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).expect("decompression must succeed");
+
+        // Depth 24 TrueColour -> 64 * 64 * 3 = 12288 bytes (RGB24)
+        assert_eq!(decompressed.len(), 64 * 64 * 3);
+
+        // Verify RGB24 pixel values
+        let expected_rgb = fb.extract_rect_bytes(&rect, &PixelFormat::rgb24());
+        assert_eq!(decompressed, expected_rgb);
+    }
+
+    #[test]
+    fn test_encode_pseudo_cursor() {
+        let mut buf = BytesMut::new();
+        let rgba = vec![255u8, 0, 0, 255]; // 1 red pixel, opaque
+        let format = PixelFormat::bgra32();
+        encode_pseudo_cursor(0, 0, 1, 1, &rgba, &format, &mut buf);
+
+        assert_eq!(buf.len(), 12 + 4 + 1); // 12 header + 4 color + 1 bitmask byte
+        let header = UpdateRectHeader::parse(&buf[..12]).unwrap();
+        assert_eq!(header.encoding, PSEUDO_ENCODING_CURSOR);
+        assert_eq!(header.rect.width, 1);
+        assert_eq!(header.rect.height, 1);
     }
 }
 

@@ -137,6 +137,12 @@ impl ClientMessage {
                     return Ok(None);
                 }
                 let length = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+                if length > 10 * 1024 * 1024 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("ClientCutText length too large: {}", length),
+                    ));
+                }
                 let total_needed = 8 + length;
                 if buf.len() < total_needed {
                     return Ok(None);
@@ -356,6 +362,68 @@ mod tests {
         assert_eq!(&payload[4..20], &fmt.to_bytes()[..]);
         assert_eq!(&payload[20..24], &11u32.to_be_bytes());
         assert_eq!(&payload[24..], b"TestDesktop");
+    }
+
+    #[test]
+    fn test_client_message_parse_key_pointer_cuttext_continuous() {
+        // Key Event
+        let mut buf = BytesMut::new();
+        buf.put_u8(CLIENT_MSG_KEY_EVENT);
+        buf.put_u8(1); // down
+        buf.put_u16(0); // pad
+        buf.put_u32(0xFF08); // backspace
+        let msg = ClientMessage::parse(&mut buf).unwrap().unwrap();
+        assert_eq!(msg, ClientMessage::KeyEvent { down: true, key_sym: 0xFF08 });
+
+        // Pointer Event
+        buf.clear();
+        buf.put_u8(CLIENT_MSG_POINTER_EVENT);
+        buf.put_u8(1); // button 1
+        buf.put_u16(100);
+        buf.put_u16(200);
+        let msg = ClientMessage::parse(&mut buf).unwrap().unwrap();
+        assert_eq!(msg, ClientMessage::PointerEvent { button_mask: 1, x: 100, y: 200 });
+
+        // Client Cut Text
+        buf.clear();
+        buf.put_u8(CLIENT_MSG_CLIENT_CUT_TEXT);
+        buf.put_slice(&[0, 0, 0]); // pad
+        buf.put_u32(5); // len
+        buf.put_slice(b"hello");
+        let msg = ClientMessage::parse(&mut buf).unwrap().unwrap();
+        assert_eq!(msg, ClientMessage::ClientCutText("hello".to_string()));
+
+        // Client Cut Text Oversized (Limit > 10MB)
+        buf.clear();
+        buf.put_u8(CLIENT_MSG_CLIENT_CUT_TEXT);
+        buf.put_slice(&[0, 0, 0]);
+        buf.put_u32(20 * 1024 * 1024);
+        assert!(ClientMessage::parse(&mut buf).is_err());
+
+        // Enable Continuous Updates
+        buf.clear();
+        buf.put_u8(CLIENT_MSG_ENABLE_CONTINUOUS_UPDATES);
+        buf.put_u8(1); // enable
+        buf.put_u16(0);
+        buf.put_u16(0);
+        buf.put_u16(800);
+        buf.put_u16(600);
+        let msg = ClientMessage::parse(&mut buf).unwrap().unwrap();
+        assert_eq!(msg, ClientMessage::EnableContinuousUpdates {
+            enable: true,
+            rect: Rect::new(0, 0, 800, 600),
+        });
+    }
+
+    #[test]
+    fn test_server_cut_text_message() {
+        let text = "Hello Clipboard!";
+        let bytes = ServerMessage::server_cut_text(text);
+        assert_eq!(bytes[0], SERVER_MSG_SERVER_CUT_TEXT);
+        assert_eq!(&bytes[1..4], &[0, 0, 0]);
+        let len = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        assert_eq!(len, text.len());
+        assert_eq!(&bytes[8..], text.as_bytes());
     }
 }
 
