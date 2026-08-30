@@ -62,6 +62,22 @@ impl PixelFormat {
             red_max: 255,
             green_max: 255,
             blue_max: 255,
+            red_shift: 0,
+            green_shift: 8,
+            blue_shift: 16,
+        }
+    }
+
+    /// Standard 24-bit BGR (3 bytes per pixel: B, G, R)
+    pub fn bgr24() -> Self {
+        Self {
+            bits_per_pixel: 24,
+            depth: 24,
+            big_endian_flag: 0,
+            true_colour_flag: 1,
+            red_max: 255,
+            green_max: 255,
+            blue_max: 255,
             red_shift: 16,
             green_shift: 8,
             blue_shift: 0,
@@ -122,15 +138,27 @@ impl Rect {
     }
 
     pub fn intersects(&self, other: &Rect) -> bool {
-        self.x < other.x + other.width
-            && self.x + self.width > other.x
-            && self.y < other.y + other.height
-            && self.y + self.height > other.y
+        self.x < other.x.saturating_add(other.width)
+            && self.x.saturating_add(self.width) > other.x
+            && self.y < other.y.saturating_add(other.height)
+            && self.y.saturating_add(self.height) > other.y
+    }
+
+    pub fn intersection(&self, other: &Rect) -> Option<Rect> {
+        let x1 = self.x.max(other.x);
+        let y1 = self.y.max(other.y);
+        let x2 = (self.x + self.width).min(other.x + other.width);
+        let y2 = (self.y + self.height).min(other.y + other.height);
+        if x2 > x1 && y2 > y1 {
+            Some(Rect::new(x1, y1, x2 - x1, y2 - y1))
+        } else {
+            None
+        }
     }
 }
 
-/// Size of individual damage tracking tile (32x32)
-pub const TILE_SIZE: usize = 32;
+/// Size of individual damage tracking tile (64x64)
+pub const TILE_SIZE: usize = 64;
 
 /// Fast 64-bit FNV-1a inspired hash for SIMD/fast differencing of tile pixel data
 #[inline(always)]
@@ -358,69 +386,68 @@ impl TileFramebuffer {
                 .enumerate()
                 .for_each(|(row, dst_row)| {
                     let src_y = ry + row;
-                    let src_row_start = src_y * self.stride + rx * 4;
-                    let src_row = &self.buffer[src_row_start..src_row_start + rw * 4];
-
-                    if is_bgra {
-                        dst_row[..rw * 4].copy_from_slice(&src_row[..rw * 4]);
-                    } else if is_rgba {
-                        for col in 0..rw {
-                            let s = col * 4;
-                            let d = col * 4;
-                            let b = src_row[s];
-                            let g = src_row[s + 1];
-                            let r = src_row[s + 2];
-                            let a = src_row[s + 3];
-                            dst_row[d] = r;
-                            dst_row[d + 1] = g;
-                            dst_row[d + 2] = b;
-                            dst_row[d + 3] = a;
-                        }
-                    } else if is_rgb24 {
-                        for col in 0..rw {
-                            let s = col * 4;
-                            let d = col * 3;
-                            let b = src_row[s];
-                            let g = src_row[s + 1];
-                            let r = src_row[s + 2];
-                            let a = src_row[s + 3];
-                            let _ = a;
-                            dst_row[d] = r;
-                            dst_row[d + 1] = g;
-                            dst_row[d + 2] = b;
-                        }
-                    } else if is_bgr24 {
-                        for col in 0..rw {
-                            let s = col * 4;
-                            let d = col * 3;
-                            let b = src_row[s];
-                            let g = src_row[s + 1];
-                            let r = src_row[s + 2];
-                            let a = src_row[s + 3];
-                            let _ = a;
-                            dst_row[d] = b;
-                            dst_row[d + 1] = g;
-                            dst_row[d + 2] = r;
-                        }
-                    } else {
-                        // Generic fallback
-                        for col in 0..rw {
-                            let s = col * 4;
-                            let d = col * bpp;
-                            let b = src_row[s];
-                            let g = src_row[s + 1];
-                            let r = src_row[s + 2];
-                            let a = src_row[s + 3];
-                            let _ = a;
-                            if bpp == 4 {
-                                dst_row[d] = r;
-                                dst_row[d + 1] = g;
-                                dst_row[d + 2] = b;
-                                dst_row[d + 3] = a;
-                            } else if bpp == 3 {
-                                dst_row[d] = r;
-                                dst_row[d + 1] = g;
-                                dst_row[d + 2] = b;
+                    if src_y < self.height as usize && rx < self.width as usize {
+                        let copy_w = rw.min(self.width as usize - rx);
+                        let src_row_start = src_y * self.stride + rx * 4;
+                        let src_row_end = src_row_start + copy_w * 4;
+                        if src_row_end <= self.buffer.len() {
+                            let src_row = &self.buffer[src_row_start..src_row_end];
+                            if is_bgra {
+                                dst_row[..copy_w * 4].copy_from_slice(&src_row[..copy_w * 4]);
+                            } else if is_rgba {
+                                for col in 0..copy_w {
+                                    let s = col * 4;
+                                    let d = col * 4;
+                                    let b = src_row[s];
+                                    let g = src_row[s + 1];
+                                    let r = src_row[s + 2];
+                                    let a = src_row[s + 3];
+                                    dst_row[d] = r;
+                                    dst_row[d + 1] = g;
+                                    dst_row[d + 2] = b;
+                                    dst_row[d + 3] = a;
+                                }
+                            } else if is_rgb24 {
+                                for col in 0..copy_w {
+                                    let s = col * 4;
+                                    let d = col * 3;
+                                    let b = src_row[s];
+                                    let g = src_row[s + 1];
+                                    let r = src_row[s + 2];
+                                    dst_row[d] = r;
+                                    dst_row[d + 1] = g;
+                                    dst_row[d + 2] = b;
+                                }
+                            } else if is_bgr24 {
+                                for col in 0..copy_w {
+                                    let s = col * 4;
+                                    let d = col * 3;
+                                    let b = src_row[s];
+                                    let g = src_row[s + 1];
+                                    let r = src_row[s + 2];
+                                    dst_row[d] = b;
+                                    dst_row[d + 1] = g;
+                                    dst_row[d + 2] = r;
+                                }
+                            } else {
+                                for col in 0..copy_w {
+                                    let s = col * 4;
+                                    let d = col * bpp;
+                                    let b = src_row[s];
+                                    let g = src_row[s + 1];
+                                    let r = src_row[s + 2];
+                                    let a = src_row[s + 3];
+                                    if bpp == 4 {
+                                        dst_row[d] = r;
+                                        dst_row[d + 1] = g;
+                                        dst_row[d + 2] = b;
+                                        dst_row[d + 3] = a;
+                                    } else if bpp == 3 {
+                                        dst_row[d] = r;
+                                        dst_row[d + 1] = g;
+                                        dst_row[d + 2] = b;
+                                    }
+                                }
                             }
                         }
                     }
@@ -429,60 +456,61 @@ impl TileFramebuffer {
             // Small tile sequential fast path
             for row in 0..rh {
                 let src_y = ry + row;
-                let src_row_start = src_y * self.stride + rx * 4;
-                let dst_row_start = row * dst_stride;
+                if src_y < self.height as usize && rx < self.width as usize {
+                    let copy_w = rw.min(self.width as usize - rx);
+                    let src_row_start = src_y * self.stride + rx * 4;
+                    let src_row_end = src_row_start + copy_w * 4;
+                    let dst_row_start = row * dst_stride;
 
-                if src_row_start + rw * 4 <= self.buffer.len()
-                    && dst_row_start + dst_stride <= out.len()
-                {
-                    let src_row = &self.buffer[src_row_start..src_row_start + rw * 4];
-                    let dst_row = &mut out[dst_row_start..dst_row_start + dst_stride];
+                    if src_row_end <= self.buffer.len() && dst_row_start + dst_stride <= out.len() {
+                        let src_row = &self.buffer[src_row_start..src_row_end];
+                        let dst_row = &mut out[dst_row_start..dst_row_start + dst_stride];
 
-                    if is_bgra {
-                        dst_row.copy_from_slice(src_row);
-                    } else if is_rgba {
-                        for col in 0..rw {
-                            let s = col * 4;
-                            let d = col * 4;
-                            dst_row[d] = src_row[s + 2]; // R
-                            dst_row[d + 1] = src_row[s + 1]; // G
-                            dst_row[d + 2] = src_row[s]; // B
-                            dst_row[d + 3] = src_row[s + 3]; // A
-                        }
-                    } else if is_rgb24 {
-                        for col in 0..rw {
-                            let s = col * 4;
-                            let d = col * 3;
-                            dst_row[d] = src_row[s + 2]; // R
-                            dst_row[d + 1] = src_row[s + 1]; // G
-                            dst_row[d + 2] = src_row[s]; // B
-                        }
-                    } else if is_bgr24 {
-                        for col in 0..rw {
-                            let s = col * 4;
-                            let d = col * 3;
-                            dst_row[d] = src_row[s]; // B
-                            dst_row[d + 1] = src_row[s + 1]; // G
-                            dst_row[d + 2] = src_row[s + 2]; // R
-                        }
-                    } else {
-                        for col in 0..rw {
-                            let s = col * 4;
-                            let d = col * bpp;
-                            let b = src_row[s];
-                            let g = src_row[s + 1];
-                            let r = src_row[s + 2];
-                            let a = src_row[s + 3];
-                            let _ = a;
-                            if bpp == 4 {
-                                dst_row[d] = r;
-                                dst_row[d + 1] = g;
-                                dst_row[d + 2] = b;
-                                dst_row[d + 3] = a;
-                            } else if bpp == 3 {
-                                dst_row[d] = r;
-                                dst_row[d + 1] = g;
-                                dst_row[d + 2] = b;
+                        if is_bgra {
+                            dst_row[..copy_w * 4].copy_from_slice(&src_row[..copy_w * 4]);
+                        } else if is_rgba {
+                            for col in 0..copy_w {
+                                let s = col * 4;
+                                let d = col * 4;
+                                dst_row[d] = src_row[s + 2]; // R
+                                dst_row[d + 1] = src_row[s + 1]; // G
+                                dst_row[d + 2] = src_row[s]; // B
+                                dst_row[d + 3] = src_row[s + 3]; // A
+                            }
+                        } else if is_rgb24 {
+                            for col in 0..copy_w {
+                                let s = col * 4;
+                                let d = col * 3;
+                                dst_row[d] = src_row[s + 2]; // R
+                                dst_row[d + 1] = src_row[s + 1]; // G
+                                dst_row[d + 2] = src_row[s]; // B
+                            }
+                        } else if is_bgr24 {
+                            for col in 0..copy_w {
+                                let s = col * 4;
+                                let d = col * 3;
+                                dst_row[d] = src_row[s]; // B
+                                dst_row[d + 1] = src_row[s + 1]; // G
+                                dst_row[d + 2] = src_row[s + 2]; // R
+                            }
+                        } else {
+                            for col in 0..copy_w {
+                                let s = col * 4;
+                                let d = col * bpp;
+                                let b = src_row[s];
+                                let g = src_row[s + 1];
+                                let r = src_row[s + 2];
+                                let a = src_row[s + 3];
+                                if bpp == 4 {
+                                    dst_row[d] = r;
+                                    dst_row[d + 1] = g;
+                                    dst_row[d + 2] = b;
+                                    dst_row[d + 3] = a;
+                                } else if bpp == 3 {
+                                    dst_row[d] = r;
+                                    dst_row[d + 1] = g;
+                                    dst_row[d + 2] = b;
+                                }
                             }
                         }
                     }
@@ -528,3 +556,64 @@ impl SharedFramebuffer {
         let _ = self.notify_tx.send(v);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rect_intersection() {
+        let r1 = Rect::new(0, 0, 100, 100);
+        let r2 = Rect::new(50, 50, 100, 100);
+        assert!(r1.intersects(&r2));
+
+        let inter = r1.intersection(&r2).expect("intersection expected");
+        assert_eq!(inter, Rect::new(50, 50, 50, 50));
+
+        let r3 = Rect::new(200, 200, 50, 50);
+        assert!(!r1.intersects(&r3));
+        assert_eq!(r1.intersection(&r3), None);
+    }
+
+    #[test]
+    fn test_tile_framebuffer_64x64_damage_tracking() {
+        let mut fb = TileFramebuffer::new(128, 128);
+        assert_eq!(fb.tiles_x, 2);
+        assert_eq!(fb.tiles_y, 2);
+
+        // First detect: all tiles dirty
+        let damaged = fb.detect_damage_tiles();
+        assert_eq!(damaged.len(), 4);
+
+        // Next detect without changes: 0 tiles dirty
+        let damaged2 = fb.detect_damage_tiles();
+        assert_eq!(damaged2.len(), 0);
+
+        // Update single tile (top-left)
+        let patch = vec![0xFF; 64 * 64 * 4];
+        fb.update_rect(0, 0, 64, 64, &patch, 64 * 4);
+
+        let damaged3 = fb.detect_damage_tiles();
+        assert_eq!(damaged3.len(), 1);
+        assert_eq!(damaged3[0], Rect::new(0, 0, 64, 64));
+    }
+
+    #[test]
+    fn test_extract_rect_bytes_rgb24() {
+        let mut fb = TileFramebuffer::new(64, 64);
+        // BGRA format: B=10, G=20, R=30, A=255
+        let pixel = [10u8, 20, 30, 255];
+        let patch: Vec<u8> = pixel.iter().cycle().take(64 * 64 * 4).copied().collect();
+        fb.update_rect(0, 0, 64, 64, &patch, 64 * 4);
+
+        let rect = Rect::new(0, 0, 2, 2);
+        let rgb_format = PixelFormat::rgb24();
+        let extracted = fb.extract_rect_bytes(&rect, &rgb_format);
+
+        assert_eq!(extracted.len(), 2 * 2 * 3); // 12 bytes
+        // In RGB24: R=30, G=20, B=10
+        assert_eq!(&extracted[0..3], &[30, 20, 10]);
+        assert_eq!(&extracted[3..6], &[30, 20, 10]);
+    }
+}
+

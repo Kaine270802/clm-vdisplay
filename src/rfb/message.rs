@@ -1,5 +1,5 @@
 use crate::display::framebuffer::{PixelFormat, Rect};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BytesMut};
 use std::io;
 
 pub const RFB_VERSION_3_8: &[u8; 12] = b"RFB 003.008\n";
@@ -169,24 +169,56 @@ impl ClientMessage {
     }
 }
 
-/// An update rectangle header in FramebufferUpdate message
-#[derive(Debug, Clone)]
+/// An update rectangle header in FramebufferUpdate message (RFC 6143 Section 7.6.1)
+/// Total size: exactly 12 bytes Big-Endian:
+/// - x-position: 2 bytes (u16 BE)
+/// - y-position: 2 bytes (u16 BE)
+/// - width: 2 bytes (u16 BE)
+/// - height: 2 bytes (u16 BE)
+/// - encoding-type: 4 bytes (i32 BE)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UpdateRectHeader {
     pub rect: Rect,
     pub encoding: i32,
 }
 
 impl UpdateRectHeader {
+    pub const HEADER_SIZE: usize = 12;
+
+    #[inline]
     pub fn new(rect: Rect, encoding: i32) -> Self {
         Self { rect, encoding }
     }
 
+    #[inline]
+    pub fn to_bytes(&self) -> [u8; 12] {
+        let mut buf = [0u8; 12];
+        buf[0..2].copy_from_slice(&self.rect.x.to_be_bytes());
+        buf[2..4].copy_from_slice(&self.rect.y.to_be_bytes());
+        buf[4..6].copy_from_slice(&self.rect.width.to_be_bytes());
+        buf[6..8].copy_from_slice(&self.rect.height.to_be_bytes());
+        buf[8..12].copy_from_slice(&self.encoding.to_be_bytes());
+        buf
+    }
+
+    #[inline]
     pub fn write_to(&self, buf: &mut BytesMut) {
-        buf.put_u16(self.rect.x);
-        buf.put_u16(self.rect.y);
-        buf.put_u16(self.rect.width);
-        buf.put_u16(self.rect.height);
-        buf.put_i32(self.encoding);
+        buf.extend_from_slice(&self.to_bytes());
+    }
+
+    pub fn parse(slice: &[u8]) -> Option<Self> {
+        if slice.len() < 12 {
+            return None;
+        }
+        let x = u16::from_be_bytes([slice[0], slice[1]]);
+        let y = u16::from_be_bytes([slice[2], slice[3]]);
+        let width = u16::from_be_bytes([slice[4], slice[5]]);
+        let height = u16::from_be_bytes([slice[6], slice[7]]);
+        let encoding = i32::from_be_bytes([slice[8], slice[9], slice[10], slice[11]]);
+        Some(Self {
+            rect: Rect::new(x, y, width, height),
+            encoding,
+        })
     }
 }
 
@@ -194,23 +226,24 @@ impl UpdateRectHeader {
 pub struct ServerMessage;
 
 impl ServerMessage {
-    /// Build ServerInit payload
+    /// Build ServerInit payload (RFC 6143 Section 7.3.2)
     pub fn server_init(
         width: u16,
         height: u16,
         format: &PixelFormat,
         desktop_name: &str,
     ) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(24 + desktop_name.len());
+        let name_bytes = desktop_name.as_bytes();
+        let mut buf = Vec::with_capacity(24 + name_bytes.len());
         buf.extend_from_slice(&width.to_be_bytes());
         buf.extend_from_slice(&height.to_be_bytes());
         buf.extend_from_slice(&format.to_bytes());
-        buf.extend_from_slice(&(desktop_name.len() as u32).to_be_bytes());
-        buf.extend_from_slice(desktop_name.as_bytes());
+        buf.extend_from_slice(&(name_bytes.len() as u32).to_be_bytes());
+        buf.extend_from_slice(name_bytes);
         buf
     }
 
-    /// Build ServerCutText message
+    /// Build ServerCutText message (RFC 6143 Section 7.6.4)
     pub fn server_cut_text(text: &str) -> Vec<u8> {
         let bytes = text.as_bytes();
         let mut buf = Vec::with_capacity(8 + bytes.len());
@@ -221,7 +254,7 @@ impl ServerMessage {
         buf
     }
 
-    /// Build Bell message
+    /// Build Bell message (RFC 6143 Section 7.6.3)
     pub fn bell() -> [u8; 1] {
         [SERVER_MSG_BELL]
     }
@@ -231,3 +264,98 @@ impl ServerMessage {
         [SERVER_MSG_END_OF_CONTINUOUS_UPDATES]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BufMut;
+
+    #[test]
+    fn test_update_rect_header_12_bytes_big_endian() {
+        let header = UpdateRectHeader::new(Rect::new(10, 20, 64, 64), ENCODING_RAW);
+        let bytes = header.to_bytes();
+        assert_eq!(bytes.len(), 12);
+        assert_eq!(&bytes[0..2], &10u16.to_be_bytes());
+        assert_eq!(&bytes[2..4], &20u16.to_be_bytes());
+        assert_eq!(&bytes[4..6], &64u16.to_be_bytes());
+        assert_eq!(&bytes[6..8], &64u16.to_be_bytes());
+        assert_eq!(&bytes[8..12], &0i32.to_be_bytes());
+
+        let mut buf = BytesMut::new();
+        header.write_to(&mut buf);
+        assert_eq!(&buf[..], &bytes[..]);
+
+        let parsed = UpdateRectHeader::parse(&bytes).expect("Failed to parse header");
+        assert_eq!(parsed, header);
+    }
+
+    #[test]
+    fn test_update_rect_header_pseudo_encodings() {
+        // LastRect (-224)
+        let last_rect = UpdateRectHeader::new(Rect::new(0, 0, 0, 0), PSEUDO_ENCODING_LAST_RECT);
+        let bytes = last_rect.to_bytes();
+        assert_eq!(bytes.len(), 12);
+        assert_eq!(&bytes[8..12], &(-224i32).to_be_bytes());
+        let parsed = UpdateRectHeader::parse(&bytes).unwrap();
+        assert_eq!(parsed.encoding, PSEUDO_ENCODING_LAST_RECT);
+
+        // DesktopSize (-223)
+        let dt_size = UpdateRectHeader::new(Rect::new(0, 0, 1920, 1080), PSEUDO_ENCODING_DESKTOP_SIZE);
+        let bytes = dt_size.to_bytes();
+        let parsed = UpdateRectHeader::parse(&bytes).unwrap();
+        assert_eq!(parsed.rect.width, 1920);
+        assert_eq!(parsed.rect.height, 1080);
+        assert_eq!(parsed.encoding, PSEUDO_ENCODING_DESKTOP_SIZE);
+    }
+
+    #[test]
+    fn test_client_message_parse_set_encodings() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(CLIENT_MSG_SET_ENCODINGS);
+        buf.put_u8(0); // pad
+        buf.put_u16(3); // count
+        buf.put_i32(ENCODING_RAW);
+        buf.put_i32(ENCODING_TIGHT);
+        buf.put_i32(PSEUDO_ENCODING_LAST_RECT);
+
+        let msg = ClientMessage::parse(&mut buf).unwrap().expect("parsed message");
+        match msg {
+            ClientMessage::SetEncodings(encs) => {
+                assert_eq!(encs, vec![ENCODING_RAW, ENCODING_TIGHT, PSEUDO_ENCODING_LAST_RECT]);
+            }
+            _ => panic!("Unexpected message type"),
+        }
+    }
+
+    #[test]
+    fn test_client_message_parse_framebuffer_update_req() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(CLIENT_MSG_FRAMEBUFFER_UPDATE_REQ);
+        buf.put_u8(1); // incremental
+        buf.put_u16(0); // x
+        buf.put_u16(0); // y
+        buf.put_u16(1920); // w
+        buf.put_u16(1080); // h
+
+        let msg = ClientMessage::parse(&mut buf).unwrap().expect("parsed message");
+        match msg {
+            ClientMessage::FramebufferUpdateRequest { incremental, rect } => {
+                assert!(incremental);
+                assert_eq!(rect, Rect::new(0, 0, 1920, 1080));
+            }
+            _ => panic!("Unexpected message type"),
+        }
+    }
+
+    #[test]
+    fn test_server_init_payload() {
+        let fmt = PixelFormat::bgra32();
+        let payload = ServerMessage::server_init(1920, 1080, &fmt, "TestDesktop");
+        assert_eq!(&payload[0..2], &1920u16.to_be_bytes());
+        assert_eq!(&payload[2..4], &1080u16.to_be_bytes());
+        assert_eq!(&payload[4..20], &fmt.to_bytes()[..]);
+        assert_eq!(&payload[20..24], &11u32.to_be_bytes());
+        assert_eq!(&payload[24..], b"TestDesktop");
+    }
+}
+

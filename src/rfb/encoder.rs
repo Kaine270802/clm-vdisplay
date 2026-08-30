@@ -75,20 +75,19 @@ pub fn encode_tight_rect(
 
     // 1. Check for Solid Fill (1 pixel color)
     if let Some(solid_pixel) = get_solid_color_slice(&pixel_data, bpp) {
-        buf.put_u8(0x80 | 0x08); // 0x80: Fill, stream 0
+        buf.put_u8(0x80); // 0x80: Fill compression type, stream 0
         buf.extend_from_slice(solid_pixel);
         return;
     }
 
-    // 2. If small, use uncompressed stream
-    if pixel_data.len() < 128 {
-        buf.put_u8(0x00); // comp-ctl: stream 0, raw
-        write_compact_len(buf, pixel_data.len());
+    // 2. Small rectangle raw fallback (< 12 bytes per Tight spec)
+    if pixel_data.len() < 12 {
+        buf.put_u8(0x00); // comp-ctl: stream 0, raw (no reset, no filter)
         buf.extend_from_slice(&pixel_data);
         return;
     }
 
-    // 3. Compress with Flate2 Zlib
+    // 3. Compress with Flate2 Zlib using stream 0 with reset bit (0x01) to avoid decompressor state desync
     let mut encoder = ZlibEncoder::new(
         Vec::with_capacity(pixel_data.len() / 2),
         Compression::fast(),
@@ -96,7 +95,7 @@ pub fn encode_tight_rect(
     if encoder.write_all(&pixel_data).is_ok() {
         if let Ok(compressed) = encoder.finish() {
             if compressed.len() < pixel_data.len() {
-                buf.put_u8(0x00);
+                buf.put_u8(0x01); // comp-ctl: stream 0, reset bit (0x01)
                 write_compact_len(buf, compressed.len());
                 buf.extend_from_slice(&compressed);
                 return;
@@ -230,3 +229,103 @@ pub fn encode_pseudo_desktop_name(name: &str, buf: &mut BytesMut) {
     buf.put_u32(name.len() as u32);
     buf.extend_from_slice(name.as_bytes());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_write_compact_len_1_2_3_bytes() {
+        let mut buf = BytesMut::new();
+
+        // 1 byte (< 128)
+        write_compact_len(&mut buf, 50);
+        assert_eq!(&buf[..], &[50]);
+
+        // 2 bytes (128..16383)
+        buf.clear();
+        write_compact_len(&mut buf, 300);
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0], (300 & 0x7F) as u8 | 0x80);
+        assert_eq!(buf[1], (300 >> 7) as u8);
+
+        // 3 bytes (>= 16384)
+        buf.clear();
+        write_compact_len(&mut buf, 20000);
+        assert_eq!(buf.len(), 3);
+        assert_eq!(buf[0], (20000 & 0x7F) as u8 | 0x80);
+        assert_eq!(buf[1], ((20000 >> 7) & 0x7F) as u8 | 0x80);
+        assert_eq!(buf[2], (20000 >> 14) as u8);
+    }
+
+    #[test]
+    fn test_encode_raw_rect_byte_alignment() {
+        let mut fb = TileFramebuffer::new(64, 64);
+        let patch = vec![0x42; 64 * 64 * 4];
+        fb.update_rect(0, 0, 64, 64, &patch, 64 * 4);
+
+        let mut buf = BytesMut::new();
+        let format = PixelFormat::bgra32();
+        let rect = Rect::new(0, 0, 64, 64);
+
+        encode_raw_rect(&fb, &rect, &format, &mut buf);
+
+        // Header: 12 bytes + Data: 64 * 64 * 4 = 16384 bytes
+        assert_eq!(buf.len(), 12 + 16384);
+
+        let header = UpdateRectHeader::parse(&buf[..12]).expect("parsed header");
+        assert_eq!(header.rect, rect);
+        assert_eq!(header.encoding, ENCODING_RAW);
+        assert_eq!(&buf[12..16], &[0x42, 0x42, 0x42, 0x42]);
+    }
+
+    #[test]
+    fn test_encode_tight_rect_solid_fill() {
+        let fb = TileFramebuffer::new(64, 64);
+        let mut buf = BytesMut::new();
+        let format = PixelFormat::bgra32();
+        let rect = Rect::new(0, 0, 64, 64);
+
+        encode_tight_rect(&fb, &rect, &format, &mut buf);
+
+        // Header: 12 bytes
+        // Solid fill flag: 1 byte (0x80)
+        // Solid pixel (BGRA): 4 bytes (0, 0, 0, 0)
+        assert_eq!(buf.len(), 12 + 1 + 4);
+
+        let header = UpdateRectHeader::parse(&buf[..12]).expect("parsed header");
+        assert_eq!(header.encoding, ENCODING_TIGHT);
+        assert_eq!(buf[12], 0x80); // Fill
+        assert_eq!(&buf[13..17], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_pseudo_encodings_generation() {
+        let mut buf = BytesMut::new();
+
+        // DesktopSize
+        encode_pseudo_desktop_size(1920, 1080, &mut buf);
+        assert_eq!(buf.len(), 12);
+        let h_ds = UpdateRectHeader::parse(&buf[..12]).unwrap();
+        assert_eq!(h_ds.rect, Rect::new(0, 0, 1920, 1080));
+        assert_eq!(h_ds.encoding, PSEUDO_ENCODING_DESKTOP_SIZE);
+
+        // LastRect
+        buf.clear();
+        encode_pseudo_last_rect(&mut buf);
+        assert_eq!(buf.len(), 12);
+        let h_lr = UpdateRectHeader::parse(&buf[..12]).unwrap();
+        assert_eq!(h_lr.rect, Rect::new(0, 0, 0, 0));
+        assert_eq!(h_lr.encoding, PSEUDO_ENCODING_LAST_RECT);
+
+        // DesktopName
+        buf.clear();
+        encode_pseudo_desktop_name("MyDesktop", &mut buf);
+        assert_eq!(buf.len(), 12 + 4 + 9);
+        let h_dn = UpdateRectHeader::parse(&buf[..12]).unwrap();
+        assert_eq!(h_dn.encoding, PSEUDO_ENCODING_DESKTOP_NAME);
+        assert_eq!(&buf[12..16], &9u32.to_be_bytes());
+        assert_eq!(&buf[16..], b"MyDesktop");
+    }
+}
+

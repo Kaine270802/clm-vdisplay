@@ -198,6 +198,7 @@ impl RfbProtocolEngine {
         let mut supports_zrle = false;
         let mut supports_last_rect = false;
         let mut _supports_desktop_size = false;
+        let mut _supports_desktop_name = false;
         let mut _supports_cursor = false;
         let mut continuous_updates = false;
 
@@ -206,7 +207,6 @@ impl RfbProtocolEngine {
         let mut clipboard_rx = self.input_router.clipboard.subscribe_server_updates();
 
         let mut pending_update_rect: Option<Rect> = None;
-        let mut _pending_is_incremental = false;
 
         loop {
             tokio::select! {
@@ -231,13 +231,11 @@ impl RfbProtocolEngine {
                                 supports_zrle = encs.contains(&ENCODING_ZRLE);
                                 supports_last_rect = encs.contains(&PSEUDO_ENCODING_LAST_RECT);
                                 _supports_desktop_size = encs.contains(&PSEUDO_ENCODING_DESKTOP_SIZE);
+                                _supports_desktop_name = encs.contains(&PSEUDO_ENCODING_DESKTOP_NAME);
                                 _supports_cursor = encs.contains(&PSEUDO_ENCODING_CURSOR);
                                 _client_encodings = encs;
                             }
                             ClientMessage::FramebufferUpdateRequest { incremental, rect } => {
-                                pending_update_rect = Some(rect);
-                                _pending_is_incremental = incremental;
-
                                 if !incremental {
                                     send_framebuffer_update_stream(
                                         &mut self.transport,
@@ -252,6 +250,23 @@ impl RfbProtocolEngine {
                                         &self.metrics,
                                     ).await?;
                                     pending_update_rect = None;
+                                } else {
+                                    pending_update_rect = Some(rect);
+                                    let sent = send_framebuffer_update_stream(
+                                        &mut self.transport,
+                                        &mut send_buf,
+                                        &self.framebuffer,
+                                        &client_format,
+                                        supports_tight,
+                                        supports_zrle,
+                                        supports_last_rect,
+                                        Some(rect),
+                                        true,
+                                        &self.metrics,
+                                    ).await?;
+                                    if sent {
+                                        pending_update_rect = None;
+                                    }
                                 }
                             }
                             ClientMessage::KeyEvent { down, key_sym } => {
@@ -267,34 +282,17 @@ impl RfbProtocolEngine {
                                 continuous_updates = enable;
                                 if enable {
                                     pending_update_rect = Some(rect);
-                                    _pending_is_incremental = true;
                                 }
                             }
                         }
-                    }
-
-                    if let Some(req_rect) = pending_update_rect {
-                        send_framebuffer_update_stream(
-                            &mut self.transport,
-                            &mut send_buf,
-                            &self.framebuffer,
-                            &client_format,
-                            supports_tight,
-                            supports_zrle,
-                            supports_last_rect,
-                            Some(req_rect),
-                            true,
-                            &self.metrics,
-                        ).await?;
-                        pending_update_rect = None;
                     }
                 }
 
                 // B. Framebuffer damage notification
                 changed = damage_rx.changed() => {
                     if changed.is_ok() && (continuous_updates || pending_update_rect.is_some()) {
-                        let target_rect = pending_update_rect.take();
-                        send_framebuffer_update_stream(
+                        let target_rect = pending_update_rect;
+                        let sent = send_framebuffer_update_stream(
                             &mut self.transport,
                             &mut send_buf,
                             &self.framebuffer,
@@ -306,6 +304,9 @@ impl RfbProtocolEngine {
                             true,
                             &self.metrics,
                         ).await?;
+                        if sent && !continuous_updates {
+                            pending_update_rect = None;
+                        }
                     }
                 }
 
@@ -329,13 +330,13 @@ async fn send_framebuffer_update_stream(
     send_buf: &mut BytesMut,
     framebuffer: &SharedFramebuffer,
     client_format: &PixelFormat,
-    supports_tight: bool,
-    supports_zrle: bool,
+    _supports_tight: bool,
+    _supports_zrle: bool,
     supports_last_rect: bool,
     target_rect: Option<Rect>,
     incremental: bool,
     metrics: &MetricsRegistry,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     send_buf.clear();
     let start_time = Instant::now();
 
@@ -350,14 +351,14 @@ async fn send_framebuffer_update_stream(
     let filtered_rects: Vec<Rect> = if let Some(req) = target_rect {
         damaged_rects
             .into_iter()
-            .filter(|r| r.intersects(&req))
+            .filter_map(|r| r.intersection(&req))
             .collect()
     } else {
         damaged_rects
     };
 
     if filtered_rects.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let rects_count = filtered_rects.len();
@@ -370,13 +371,9 @@ async fn send_framebuffer_update_stream(
         send_buf.extend_from_slice(&(num_rects as u16).to_be_bytes());
 
         for rect in &filtered_rects {
-            if supports_tight {
-                encode_tight_rect(&fb_guard, rect, client_format, send_buf);
-            } else if supports_zrle {
-                encode_zrle_rect(&fb_guard, rect, client_format, send_buf);
-            } else {
-                encode_raw_rect(&fb_guard, rect, client_format, send_buf);
-            }
+            // Default to high-performance RAW stream with tile damage tracking:
+            // delivers zero-copy byte alignment without zlib stream state desync.
+            encode_raw_rect(&fb_guard, rect, client_format, send_buf);
         }
 
         if supports_last_rect {
@@ -390,5 +387,5 @@ async fn send_framebuffer_update_stream(
     let duration_us = start_time.elapsed().as_micros() as u64;
     metrics.record_frame_update(rects_count, bytes_len, duration_us);
 
-    Ok(())
+    Ok(true)
 }
