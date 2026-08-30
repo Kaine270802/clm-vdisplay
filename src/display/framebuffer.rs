@@ -344,6 +344,11 @@ impl TileFramebuffer {
         self.frame_version = self.frame_version.wrapping_add(1);
     }
 
+    /// Check if any tiles are currently marked dirty
+    pub fn has_dirty_tiles(&self) -> bool {
+        self.dirty_tiles.iter().any(|&d| d)
+    }
+
     /// Detect changed tiles using fast 64-bit differencing, update hashes, and return damaged rectangles
     pub fn detect_damage_tiles(&mut self) -> Vec<Rect> {
         let mut damaged_rects = Vec::new();

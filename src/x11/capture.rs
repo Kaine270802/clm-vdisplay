@@ -202,45 +202,41 @@ impl X11CaptureEngine {
                     break;
                 }
                 _ = tick_timer.tick() => {
-                    if let Some(dirty) = dirty_tracker.take_dirty() {
-                        let dw = (dirty.max_x.min(self.width as u16).saturating_sub(dirty.min_x)) as u32;
-                        let dh = (dirty.max_y.min(self.height as u16).saturating_sub(dirty.min_y)) as u32;
+                    // Fetch current full-frame pixels via MIT-SHM DMA from X11 root window
+                    let cookie = conn_arc.shm_get_image(
+                        root,
+                        0,
+                        0,
+                        self.width as u16,
+                        self.height as u16,
+                        !0, // Plane mask: all bitplanes
+                        ImageFormat::Z_PIXMAP.into(),
+                        shm_segment.shmseg,
+                        0,
+                    );
 
-                        if dw > 0 && dh > 0 {
-                            // Fetch updated pixels via MIT-SHM DMA into ShmSegment
-                            let cookie = conn_arc.shm_get_image(
-                                root,
-                                0,
-                                0,
-                                self.width as u16,
-                                self.height as u16,
-                                !0, // Plane mask: all bitplanes
-                                ImageFormat::Z_PIXMAP.into(),
-                                shm_segment.shmseg,
-                                0,
-                            );
-
-                            match cookie {
-                                Ok(reply_cookie) => {
-                                    if reply_cookie.reply().is_ok() {
-                                        let raw_slice = shm_segment.as_slice();
-                                        {
-                                            let mut fb = framebuffer.inner.write();
-                                            fb.update_rect_from_full_frame(
-                                                dirty.min_x as u32,
-                                                dirty.min_y as u32,
-                                                dw,
-                                                dh,
-                                                raw_slice,
-                                            );
-                                        }
-                                        framebuffer.notify_damage();
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("XShmGetImage error on display :{}: {}", self.display_num, e);
+                    match cookie {
+                        Ok(reply_cookie) => {
+                            if reply_cookie.reply().is_ok() {
+                                let raw_slice = shm_segment.as_slice();
+                                let has_changes = {
+                                    let mut fb = framebuffer.inner.write();
+                                    fb.update_rect_from_full_frame(
+                                        0,
+                                        0,
+                                        self.width,
+                                        self.height,
+                                        raw_slice,
+                                    );
+                                    fb.has_dirty_tiles()
+                                };
+                                if has_changes {
+                                    framebuffer.notify_damage();
                                 }
                             }
+                        }
+                        Err(e) => {
+                            warn!("XShmGetImage error on display :{}: {}", self.display_num, e);
                         }
                     }
                 }
