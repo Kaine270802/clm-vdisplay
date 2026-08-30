@@ -1,10 +1,72 @@
 use clap::Parser;
 use clm_vdisplay::config::{AppConfig, Cli, Commands};
 use clm_vdisplay::metrics::{MetricsServer, GLOBAL_METRICS};
-use clm_vdisplay::server::{DisplaySession, DisplaySupervisor, SessionConfig};
+use clm_vdisplay::server::{DisplaySession, DisplaySupervisor};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
+
+/// Wait for Unix multi-signal shutdown (SIGTERM, SIGINT, SIGHUP)
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("Failed to register SIGTERM handler: {}", e);
+            None
+        }
+    };
+
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("Failed to register SIGINT handler: {}", e);
+            None
+        }
+    };
+
+    let mut sighup = match signal(SignalKind::hangup()) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("Failed to register SIGHUP handler: {}", e);
+            None
+        }
+    };
+
+    tokio::select! {
+        _ = async {
+            if let Some(ref mut s) = sigterm {
+                s.recv().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            info!("Received SIGTERM signal. Initiating graceful shutdown...");
+        }
+        _ = async {
+            if let Some(ref mut s) = sigint {
+                s.recv().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            info!("Received SIGINT signal (Ctrl+C). Initiating graceful shutdown...");
+        }
+        _ = async {
+            if let Some(ref mut s) = sighup {
+                s.recv().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            info!("Received SIGHUP signal. Initiating graceful shutdown...");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received Ctrl+C interrupt. Initiating graceful shutdown...");
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -24,8 +86,13 @@ async fn main() -> anyhow::Result<()> {
             token,
             mode,
             metrics_port,
+            manage_x11,
+            attach,
+            xvfb_path,
+            xvfb_args,
+            fps,
         } => {
-            let app_config = AppConfig::from_start_args(
+            let app_config = AppConfig::from_start_args_full(
                 &display,
                 &resolution,
                 rfb_port,
@@ -33,11 +100,16 @@ async fn main() -> anyhow::Result<()> {
                 token.clone(),
                 &mode,
                 metrics_port,
+                manage_x11,
+                attach,
+                xvfb_path,
+                xvfb_args,
+                fps,
             );
 
             info!(
-                "Starting clm-vdisplay on display :{} (resolution={}x{}, mode={})",
-                app_config.display_num, app_config.width, app_config.height, app_config.mode
+                "Starting clm-vdisplay on display :{} (resolution={}x{}, mode={}, manage_x11={}, attach={}, fps={})",
+                app_config.display_num, app_config.width, app_config.height, app_config.mode, app_config.manage_x11, app_config.attach, app_config.fps
             );
             info!(
                 "Listening on TCP RFB (vncviewer) port: 0.0.0.0:{}",
@@ -60,17 +132,7 @@ async fn main() -> anyhow::Result<()> {
                 });
             }
 
-            let session_cfg = SessionConfig {
-                display_num: app_config.display_num,
-                width: app_config.width,
-                height: app_config.height,
-                rfb_port: app_config.rfb_port,
-                ws_port: app_config.ws_port,
-                auth_token: token,
-                mode: app_config.mode,
-            };
-
-            let mut session = DisplaySession::new(session_cfg);
+            let mut session = DisplaySession::from_app_config(&app_config);
             session.start().await?;
 
             println!(
@@ -78,9 +140,10 @@ async fn main() -> anyhow::Result<()> {
                 app_config.display_num
             );
 
-            // Wait for termination signal (Ctrl+C, SIGTERM, SIGINT)
-            tokio::signal::ctrl_c().await?;
-            info!("Received shutdown signal. Stopping display session...");
+            // Wait for Unix termination signals (SIGTERM, SIGINT, SIGHUP)
+            wait_for_shutdown_signal().await;
+
+            info!("Stopping display session...");
             cancel_token.cancel();
             session.stop().await;
             info!("clm-vdisplay terminated cleanly.");
@@ -114,8 +177,8 @@ async fn main() -> anyhow::Result<()> {
                         error!("Supervisor control server error: {}", e);
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received shutdown signal. Stopping supervisor...");
+                _ = wait_for_shutdown_signal() => {
+                    info!("Stopping supervisor...");
                     cancel.cancel();
                 }
             }

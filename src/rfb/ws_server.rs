@@ -41,6 +41,10 @@ impl WsRfbServer {
 
     pub async fn run(&self) -> anyhow::Result<()> {
         let listener = TcpListener::bind(self.bind_addr).await?;
+        self.run_with_listener(listener).await
+    }
+
+    pub async fn run_with_listener(&self, listener: TcpListener) -> anyhow::Result<()> {
         info!("WebSocket RFB (noVNC) listening on ws://{}", self.bind_addr);
 
         loop {

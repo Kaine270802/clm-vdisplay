@@ -46,6 +46,11 @@ flate2 = "1.0"
 zune-jpeg = "0.4"
 rayon = "1.10"
 
+# X11, MIT-SHM, XDamage, SysV & POSIX Process Lifecycle
+x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "randr", "xtest", "allow-unsafe-code"] }
+libc = "0.2"
+nix = { version = "0.29", features = ["signal", "process"] }
+
 # Python C-FFI / PyO3 (Optional / Feature Gated)
 pyo3 = { version = "0.21", features = ["extension-module", "abi3-py310"], optional = true }
 
@@ -60,3 +65,4 @@ python = ["dep:pyo3"]
 tokio-test = "0.4"
 criterion = { version = "0.5", features = ["async_tokio"] }
 rand = "0.8"
+tempfile = "3.10"

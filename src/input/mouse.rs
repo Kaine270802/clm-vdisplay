@@ -70,6 +70,15 @@ impl MouseRouter {
         self.state.read().clone()
     }
 
+    pub fn get_position(&self) -> (u16, u16) {
+        let state = self.state.read();
+        (state.x, state.y)
+    }
+
+    pub fn get_button_mask(&self) -> u8 {
+        self.state.read().button_mask
+    }
+
     /// Process incoming RFB PointerEvent
     pub fn handle_pointer_event(&self, button_mask: u8, x: u16, y: u16) {
         let mut state = self.state.write();

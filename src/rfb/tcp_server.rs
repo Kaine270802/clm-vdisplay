@@ -40,6 +40,10 @@ impl TcpRfbServer {
 
     pub async fn run(&self) -> anyhow::Result<()> {
         let listener = TcpListener::bind(self.bind_addr).await?;
+        self.run_with_listener(listener).await
+    }
+
+    pub async fn run_with_listener(&self, listener: TcpListener) -> anyhow::Result<()> {
         info!("Native TCP RFB (vncviewer) listening on {}", self.bind_addr);
 
         loop {

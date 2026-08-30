@@ -32,21 +32,23 @@ impl ClipboardManager {
     }
 
     /// Client sent new clipboard text via ClientCutText
-    pub fn set_from_client(&self, new_text: String) {
+    pub fn set_from_client(&self, new_text: impl Into<String>) {
+        let val = new_text.into();
         {
             let mut text = self.text.write();
-            *text = new_text.clone();
+            *text = val.clone();
         }
-        let _ = self.client_tx.send(new_text);
+        let _ = self.client_tx.send(val);
     }
 
     /// Server or local application updated clipboard, notify all VNC clients
-    pub fn set_from_server(&self, new_text: String) {
+    pub fn set_from_server(&self, new_text: impl Into<String>) {
+        let val = new_text.into();
         {
             let mut text = self.text.write();
-            *text = new_text.clone();
+            *text = val.clone();
         }
-        let _ = self.server_tx.send(new_text);
+        let _ = self.server_tx.send(val);
     }
 
     pub fn subscribe_server_updates(&self) -> broadcast::Receiver<String> {

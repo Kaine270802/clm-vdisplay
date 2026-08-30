@@ -1,4 +1,5 @@
 use parking_lot::RwLock;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -71,6 +72,7 @@ pub struct KeyAction {
 
 pub struct KeyboardRouter {
     modifiers: Arc<RwLock<ModifierState>>,
+    pressed_keys: Arc<RwLock<HashSet<u32>>>,
     event_tx: broadcast::Sender<KeyAction>,
 }
 
@@ -85,6 +87,7 @@ impl KeyboardRouter {
         let (event_tx, _) = broadcast::channel(256);
         Self {
             modifiers: Arc::new(RwLock::new(ModifierState::default())),
+            pressed_keys: Arc::new(RwLock::new(HashSet::new())),
             event_tx,
         }
     }
@@ -95,6 +98,10 @@ impl KeyboardRouter {
 
     pub fn get_modifiers(&self) -> ModifierState {
         *self.modifiers.read()
+    }
+
+    pub fn is_key_down(&self, key_sym: u32) -> bool {
+        self.pressed_keys.read().contains(&key_sym)
     }
 
     /// Resolve KeySym to Unicode character if applicable
@@ -120,6 +127,12 @@ impl KeyboardRouter {
 
     /// Handle incoming RFB KeyEvent
     pub fn handle_key_event(&self, down: bool, key_sym: u32) {
+        if down {
+            self.pressed_keys.write().insert(key_sym);
+        } else {
+            self.pressed_keys.write().remove(&key_sym);
+        }
+
         let mut mods = self.modifiers.write();
 
         match key_sym {

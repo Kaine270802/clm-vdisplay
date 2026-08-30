@@ -45,6 +45,26 @@ pub enum Commands {
         /// Prometheus metrics & health check port
         #[arg(long)]
         metrics_port: Option<u16>,
+
+        /// Automatically spawn and supervise X11 server (Xvfb) if display socket not found
+        #[arg(long, default_value_t = false)]
+        manage_x11: bool,
+
+        /// Attach to existing X11 display without managing server lifecycle
+        #[arg(long, default_value_t = false)]
+        attach: bool,
+
+        /// Custom path to Xvfb binary
+        #[arg(long, default_value = "Xvfb")]
+        xvfb_path: String,
+
+        /// Custom extra arguments to pass to Xvfb (whitespace-separated)
+        #[arg(long)]
+        xvfb_args: Option<String>,
+
+        /// Target capture frame rate (FPS)
+        #[arg(long, default_value_t = 60)]
+        fps: u32,
     },
 
     /// Run the multi-display supervisor daemon
@@ -78,6 +98,11 @@ pub struct AppConfig {
     pub control_socket: String,
     pub metrics_port: Option<u16>,
     pub enable_metrics: bool,
+    pub manage_x11: bool,
+    pub attach: bool,
+    pub xvfb_path: String,
+    pub xvfb_args: Option<Vec<String>>,
+    pub fps: u32,
 }
 
 impl Default for AppConfig {
@@ -95,6 +120,11 @@ impl Default for AppConfig {
             control_socket: "/tmp/clm-vdisplay.sock".to_string(),
             metrics_port: None,
             enable_metrics: false,
+            manage_x11: true,
+            attach: false,
+            xvfb_path: "Xvfb".to_string(),
+            xvfb_args: None,
+            fps: 60,
         }
     }
 }
@@ -109,9 +139,53 @@ impl AppConfig {
         mode: &str,
         metrics_port: Option<u16>,
     ) -> Self {
+        Self::from_start_args_full(
+            display_str,
+            resolution_str,
+            rfb_port,
+            ws_port,
+            token,
+            mode,
+            metrics_port,
+            false,
+            false,
+            "Xvfb".to_string(),
+            None,
+            60,
+        )
+    }
+
+    pub fn from_start_args_full(
+        display_str: &str,
+        resolution_str: &str,
+        rfb_port: u16,
+        ws_port: Option<u16>,
+        token: Option<String>,
+        mode: &str,
+        metrics_port: Option<u16>,
+        manage_x11: bool,
+        attach: bool,
+        xvfb_path: String,
+        xvfb_args: Option<String>,
+        fps: u32,
+    ) -> Self {
         let display_num = Self::parse_display_num(display_str);
         let (width, height, depth) = Self::parse_resolution(resolution_str);
         let enable_metrics = metrics_port.is_some();
+
+        let parsed_args = xvfb_args.map(|s| {
+            s.split_whitespace()
+                .map(|item| item.to_string())
+                .collect::<Vec<String>>()
+        });
+
+        let effective_manage_x11 = if attach {
+            false
+        } else if manage_x11 {
+            true
+        } else {
+            true
+        };
 
         Self {
             display_num,
@@ -126,6 +200,11 @@ impl AppConfig {
             control_socket: format!("/tmp/clm-vdisplay-{}.sock", display_num),
             metrics_port,
             enable_metrics,
+            manage_x11: effective_manage_x11,
+            attach,
+            xvfb_path,
+            xvfb_args: parsed_args,
+            fps: if fps == 0 { 60 } else { fps },
         }
     }
 
@@ -139,14 +218,17 @@ impl AppConfig {
         let width = parts
             .first()
             .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&w| w > 0)
             .unwrap_or(1920);
         let height = parts
             .get(1)
             .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&h| h > 0)
             .unwrap_or(1080);
         let depth = parts
             .get(2)
             .and_then(|s| s.parse::<u8>().ok())
+            .filter(|&d| d > 0)
             .unwrap_or(24);
         (width, height, depth)
     }
