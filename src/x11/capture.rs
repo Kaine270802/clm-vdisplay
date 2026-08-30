@@ -2,15 +2,13 @@ use crate::display::framebuffer::SharedFramebuffer;
 use crate::x11::shm::ShmSegment;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use x11rb::connection::Connection;
-use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
 use x11rb::protocol::shm::ConnectionExt as _;
-use x11rb::protocol::xproto::ImageFormat;
+use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
 use x11rb::rust_connection::RustConnection;
 
 /// Bounding rectangle for accumulated damaged screen regions
@@ -77,7 +75,7 @@ impl DirtyTracker {
     }
 }
 
-/// High-performance X11 Zero-Copy Framebuffer Capture Engine (MIT-SHM + XDamage)
+/// High-performance X11 Zero-Copy Framebuffer Capture Engine (MIT-SHM + xproto fallback)
 pub struct X11CaptureEngine {
     pub display_num: u32,
     pub width: u32,
@@ -105,7 +103,7 @@ impl X11CaptureEngine {
         })
     }
 
-    /// Connect to X11 server and run MIT-SHM / XDamage 60 FPS capture pipeline
+    /// Connect to X11 server and run MIT-SHM 60 FPS capture pipeline with xproto fallback
     pub async fn run_capture_loop(
         self,
         framebuffer: SharedFramebuffer,
@@ -123,74 +121,56 @@ impl X11CaptureEngine {
         let root = screen.root;
 
         // 2. Query and verify MIT-SHM extension
-        let shm_ver = conn.shm_query_version()?.reply()?;
-        info!(
-            "MIT-SHM extension available: v{}.{}",
-            shm_ver.major_version, shm_ver.minor_version
-        );
-
-        // 3. Query and setup XDamage extension
-        let damage_ver = conn.damage_query_version(1, 1)?.reply()?;
-        info!(
-            "XDamage extension available: v{}.{}",
-            damage_ver.major_version, damage_ver.minor_version
-        );
-
-        let damage_id = conn.generate_id()?;
-        conn.damage_create(damage_id, root, ReportLevel::BOUNDING_BOX)?
-            .check()?;
-
-        // 4. Allocate SysV Shared Memory Segment
-        let stride = (self.width * 4) as usize;
-        let total_size = stride * (self.height as usize);
-        let mut shm_segment = ShmSegment::create(&conn, total_size)?;
-        info!(
-            "Allocated SysV SHM segment: {} bytes for {}x{}",
-            total_size, self.width, self.height
-        );
-
-        let dirty_tracker = Arc::new(DirtyTracker::new());
-        // Initial full-frame capture
-        dirty_tracker.mark_dirty_rect(0, 0, self.width as u16, self.height as u16);
-
-        // 5. Spawn X11 Event Polling Thread
-        let conn_arc = Arc::new(conn);
-        let dirty_tracker_clone = dirty_tracker.clone();
-        let cancel_event = cancel_token.child_token();
-        let conn_event_ref = conn_arc.clone();
-
-        let event_handle = std::thread::spawn(move || {
-            while !cancel_event.is_cancelled() {
-                match conn_event_ref.poll_for_event() {
-                    Ok(Some(event)) => {
-                        if let x11rb::protocol::Event::DamageNotify(ev) = event {
-                            dirty_tracker_clone.mark_dirty_rect(
-                                ev.area.x as u16,
-                                ev.area.y as u16,
-                                ev.area.width,
-                                ev.area.height,
+        let shm_segment = match conn.shm_query_version() {
+            Ok(cookie) => match cookie.reply() {
+                Ok(shm_ver) => {
+                    info!(
+                        "MIT-SHM extension available: v{}.{}",
+                        shm_ver.major_version, shm_ver.minor_version
+                    );
+                    let stride = (self.width * 4) as usize;
+                    let total_size = stride * (self.height as usize);
+                    match ShmSegment::create(&conn, total_size) {
+                        Ok(seg) => {
+                            info!(
+                                "Allocated SysV SHM segment: {} bytes for {}x{}",
+                                total_size, self.width, self.height
                             );
-                            let _ = conn_event_ref.damage_subtract(damage_id, 0u32, 0u32);
+                            Some(seg)
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to allocate MIT-SHM segment (falling back to xproto::get_image): {}",
+                                e
+                            );
+                            None
                         }
                     }
-                    Ok(None) => {
-                        std::thread::sleep(Duration::from_micros(500));
-                    }
-                    Err(e) => {
-                        warn!("X11 event polling loop terminated: {}", e);
-                        break;
-                    }
                 }
+                Err(e) => {
+                    warn!(
+                        "MIT-SHM query version reply failed (falling back to xproto::get_image): {}",
+                        e
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                warn!(
+                    "MIT-SHM query version request failed (falling back to xproto::get_image): {}",
+                    e
+                );
+                None
             }
-        });
+        };
 
-        // 6. Frame Timing & Pacing Loop (target 60 FPS = 16.66ms interval)
+        // 3. Frame Timing & Pacing Loop (target 60 FPS = 16.66ms interval)
         let frame_pacing_nanos = (1_000_000_000u64 / (fps.max(1) as u64)).max(1_000_000);
         let mut tick_timer = interval(Duration::from_nanos(frame_pacing_nanos));
         tick_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         info!(
-            "X11CaptureEngine started at {} FPS (interval: {:?})",
+            "X11CaptureEngine started at {} FPS (interval: {:?}) without background polling contention",
             fps,
             Duration::from_nanos(frame_pacing_nanos)
         );
@@ -202,41 +182,99 @@ impl X11CaptureEngine {
                     break;
                 }
                 _ = tick_timer.tick() => {
-                    // Fetch current full-frame pixels via MIT-SHM DMA from X11 root window
-                    let cookie = conn_arc.shm_get_image(
-                        root,
-                        0,
-                        0,
-                        self.width as u16,
-                        self.height as u16,
-                        !0, // Plane mask: all bitplanes
-                        ImageFormat::Z_PIXMAP.into(),
-                        shm_segment.shmseg,
-                        0,
-                    );
+                    let mut capture_succeeded = false;
 
-                    match cookie {
-                        Ok(reply_cookie) => {
-                            if reply_cookie.reply().is_ok() {
-                                let raw_slice = shm_segment.as_slice();
-                                let has_changes = {
-                                    let mut fb = framebuffer.inner.write();
-                                    fb.update_rect_from_full_frame(
-                                        0,
-                                        0,
-                                        self.width,
-                                        self.height,
-                                        raw_slice,
-                                    );
-                                    fb.has_dirty_tiles()
-                                };
-                                if has_changes {
-                                    framebuffer.notify_damage();
+                    // Primary capture path: MIT-SHM DMA from X11 root window
+                    if let Some(ref shm) = shm_segment {
+                        let cookie = conn.shm_get_image(
+                            root,
+                            0,
+                            0,
+                            self.width as u16,
+                            self.height as u16,
+                            !0, // Plane mask: all bitplanes
+                            ImageFormat::Z_PIXMAP.into(),
+                            shm.shmseg,
+                            0,
+                        );
+
+                        match cookie {
+                            Ok(reply_cookie) => match reply_cookie.reply() {
+                                Ok(_) => {
+                                    let raw_slice = shm.as_slice();
+                                    let has_changes = {
+                                        let mut fb = framebuffer.inner.write();
+                                        fb.update_rect_from_full_frame(
+                                            0,
+                                            0,
+                                            self.width,
+                                            self.height,
+                                            raw_slice,
+                                        );
+                                        fb.has_dirty_tiles()
+                                    };
+                                    if has_changes {
+                                        framebuffer.notify_damage();
+                                    }
+                                    capture_succeeded = true;
                                 }
+                                Err(e) => {
+                                    warn!(
+                                        "XShmGetImage reply error on display :{}: {}, falling back to xproto",
+                                        self.display_num, e
+                                    );
+                                }
+                            },
+                            Err(e) => {
+                                warn!(
+                                    "XShmGetImage request error on display :{}: {}, falling back to xproto",
+                                    self.display_num, e
+                                );
                             }
                         }
-                        Err(e) => {
-                            warn!("XShmGetImage error on display :{}: {}", self.display_num, e);
+                    }
+
+                    // Fallback capture path: standard xproto get_image
+                    if !capture_succeeded {
+                        match conn.get_image(
+                            ImageFormat::Z_PIXMAP,
+                            root,
+                            0,
+                            0,
+                            self.width as u16,
+                            self.height as u16,
+                            !0,
+                        ) {
+                            Ok(cookie) => match cookie.reply() {
+                                Ok(reply) => {
+                                    let has_changes = {
+                                        let mut fb = framebuffer.inner.write();
+                                        fb.update_rect_from_full_frame(
+                                            0,
+                                            0,
+                                            self.width,
+                                            self.height,
+                                            &reply.data,
+                                        );
+                                        fb.has_dirty_tiles()
+                                    };
+                                    if has_changes {
+                                        framebuffer.notify_damage();
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "xproto get_image reply error on display :{}: {}",
+                                        self.display_num, e
+                                    );
+                                }
+                            },
+                            Err(e) => {
+                                warn!(
+                                    "xproto get_image request error on display :{}: {}",
+                                    self.display_num, e
+                                );
+                            }
                         }
                     }
                 }
@@ -244,8 +282,9 @@ impl X11CaptureEngine {
         }
 
         // Cleanup
-        shm_segment.detach(&conn_arc);
-        let _ = event_handle.join();
+        if let Some(mut shm) = shm_segment {
+            shm.detach(&conn);
+        }
 
         Ok(())
     }
