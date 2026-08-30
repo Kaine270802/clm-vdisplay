@@ -341,6 +341,9 @@ impl TileFramebuffer {
         for dirty in self.dirty_tiles.iter_mut() {
             *dirty = true;
         }
+        for hash in self.tile_hashes.iter_mut() {
+            *hash = 0;
+        }
         self.frame_version = self.frame_version.wrapping_add(1);
     }
 
@@ -360,6 +363,10 @@ impl TileFramebuffer {
 
             for tx in 0..self.tiles_x {
                 let tile_idx = (ty * self.tiles_x + tx) as usize;
+                if !self.dirty_tiles[tile_idx] {
+                    continue;
+                }
+
                 let tile_x = (tx as usize) * TILE_SIZE;
                 let tile_w = TILE_SIZE.min(self.width as usize - tile_x);
 
@@ -376,9 +383,9 @@ impl TileFramebuffer {
                     }
                 }
 
-                if self.dirty_tiles[tile_idx] || tile_hash != self.tile_hashes[tile_idx] {
+                self.dirty_tiles[tile_idx] = false;
+                if tile_hash != self.tile_hashes[tile_idx] {
                     self.tile_hashes[tile_idx] = tile_hash;
-                    self.dirty_tiles[tile_idx] = false;
 
                     damaged_rects.push(Rect::new(
                         tile_x as u16,
@@ -843,5 +850,55 @@ mod tests {
         // Pure Red: red_max (7) << 5 = 0b1110_0000 = 224
         assert_eq!(extracted[0], 224);
     }
+
+    #[test]
+    fn test_damage_tracking_static_frame_zero_bandwidth() {
+        let mut fb = TileFramebuffer::new(128, 128);
+        // Initial detection
+        let initial_damaged = fb.detect_damage_tiles();
+        assert_eq!(initial_damaged.len(), 4);
+
+        // Subsequent detection on static framebuffer yields 0 damaged tiles
+        let static_damaged = fb.detect_damage_tiles();
+        assert_eq!(static_damaged.len(), 0);
+
+        // Simulate 60 FPS capture loop writing identical browser frame
+        let browser_frame = vec![128u8; 128 * 128 * 4];
+        fb.update_rect_from_full_frame(0, 0, 128, 128, &browser_frame);
+        let first_update = fb.detect_damage_tiles();
+        assert_eq!(first_update.len(), 4);
+
+        // Second update with IDENTICAL frame must emit 0 damage
+        fb.update_rect_from_full_frame(0, 0, 128, 128, &browser_frame);
+        let second_update = fb.detect_damage_tiles();
+        assert_eq!(second_update.len(), 0);
+    }
+
+    #[test]
+    fn test_child_window_render_produces_non_zero_pixels() {
+        let mut fb = TileFramebuffer::new(256, 256);
+        // Initially black background (0x00)
+        let initial_pixels = fb.extract_rect_bytes(&Rect::new(0, 0, 256, 256), &PixelFormat::bgra32());
+        assert!(initial_pixels.iter().all(|&b| b == 0));
+
+        // Simulate Chrome child window rendering tab/address bar at (0, 0, 256, 60) with non-zero pixels
+        let mut chrome_window = vec![0x33u8; 256 * 60 * 4];
+        for i in 0..(256 * 60) {
+            chrome_window[i * 4] = 0xF1;     // B
+            chrome_window[i * 4 + 1] = 0xF2; // G
+            chrome_window[i * 4 + 2] = 0xF3; // R
+            chrome_window[i * 4 + 3] = 0xFF; // A
+        }
+        fb.update_rect(0, 0, 256, 60, &chrome_window, 256 * 4);
+
+        let damaged = fb.detect_damage_tiles();
+        assert!(!damaged.is_empty());
+
+        let window_pixels = fb.extract_rect_bytes(&Rect::new(0, 0, 256, 60), &PixelFormat::bgra32());
+        // Verify non-zero data
+        assert!(window_pixels.iter().any(|&b| b != 0));
+        assert_eq!(&window_pixels[0..4], &[0xF1, 0xF2, 0xF3, 0xFF]);
+    }
 }
+
 
