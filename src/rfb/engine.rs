@@ -156,24 +156,39 @@ impl RfbProtocolEngine {
         );
 
         // 2. Security Handshake
-        self.transport.send_bytes(&[1, SECURITY_TYPE_NONE]).await?;
+        let client_ver_3_3 = ver_str.contains("003.003");
+        let client_ver_3_7 = ver_str.contains("003.007");
 
-        let mut sec_buf = [0u8; 1];
-        self.transport
-            .read_exact(&mut sec_buf, &mut staging)
-            .await?;
-        if sec_buf[0] != SECURITY_TYPE_NONE {
-            let _ = self
-                .transport
-                .send_bytes(&SECURITY_RESULT_FAILED.to_be_bytes())
-                .await;
-            return Err(anyhow::anyhow!("Security negotiation rejected"));
+        if client_ver_3_3 {
+            // RFB 3.3: Server sends single u32 security type (None = 1)
+            self.transport
+                .send_bytes(&(SECURITY_TYPE_NONE as u32).to_be_bytes())
+                .await?;
+        } else {
+            // RFB 3.7 / 3.8+: Server sends count (1) + list of security types ([SECURITY_TYPE_NONE])
+            self.transport.send_bytes(&[1, SECURITY_TYPE_NONE]).await?;
+
+            let mut sec_buf = [0u8; 1];
+            self.transport
+                .read_exact(&mut sec_buf, &mut staging)
+                .await?;
+            if sec_buf[0] != SECURITY_TYPE_NONE {
+                if !client_ver_3_7 {
+                    let _ = self
+                        .transport
+                        .send_bytes(&SECURITY_RESULT_FAILED.to_be_bytes())
+                        .await;
+                }
+                return Err(anyhow::anyhow!("Security negotiation rejected"));
+            }
+
+            // In RFB 3.8, server sends SecurityResult OK (4 bytes 0)
+            if !client_ver_3_7 {
+                self.transport
+                    .send_bytes(&SECURITY_RESULT_OK.to_be_bytes())
+                    .await?;
+            }
         }
-
-        // Security Result OK
-        self.transport
-            .send_bytes(&SECURITY_RESULT_OK.to_be_bytes())
-            .await?;
 
         // 3. ClientInit
         let mut shared_buf = [0u8; 1];
@@ -291,6 +306,10 @@ impl RfbProtocolEngine {
                                 continuous_updates = enable;
                                 if enable {
                                     pending_update_rect = Some(rect);
+                                } else {
+                                    pending_update_rect = None;
+                                    let end_msg = ServerMessage::end_of_continuous_updates();
+                                    self.transport.send_bytes(&end_msg).await?;
                                 }
                             }
                         }
@@ -359,9 +378,9 @@ async fn send_framebuffer_update_stream(
         let mut fb = framebuffer.inner.write();
         let cur_w = fb.width as u16;
         let cur_h = fb.height as u16;
-        if cur_w != *client_width || cur_h != *client_height {
-            fb.mark_all_damaged();
-        } else if !incremental {
+        if (supports_desktop_size && (cur_w != *client_width || cur_h != *client_height))
+            || !incremental
+        {
             fb.mark_all_damaged();
         }
         (cur_w, cur_h, fb.detect_damage_tiles())
@@ -370,10 +389,24 @@ async fn send_framebuffer_update_stream(
     let size_changed =
         (current_width != *client_width || current_height != *client_height) && supports_desktop_size;
 
+    let client_bounds = Rect::new(0, 0, *client_width, *client_height);
     let filtered_rects: Vec<Rect> = if let Some(req) = target_rect {
         damaged_rects
             .into_iter()
-            .filter_map(|r| r.intersection(&req))
+            .filter_map(|r| {
+                r.intersection(&req).and_then(|ir| {
+                    if !supports_desktop_size {
+                        ir.intersection(&client_bounds)
+                    } else {
+                        Some(ir)
+                    }
+                })
+            })
+            .collect()
+    } else if !supports_desktop_size {
+        damaged_rects
+            .into_iter()
+            .filter_map(|r| r.intersection(&client_bounds))
             .collect()
     } else {
         damaged_rects
@@ -537,5 +570,146 @@ mod tests {
         let header_ds = UpdateRectHeader::parse(&recv_buf2[4..16]).unwrap();
         assert_eq!(header_ds.rect, Rect::new(0, 0, 192, 128));
         assert_eq!(header_ds.encoding, PSEUDO_ENCODING_DESKTOP_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_send_framebuffer_update_stream_bounds_clipping_without_desktop_size() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            socket
+        });
+
+        let mut client_socket = TcpStream::connect(addr).await.unwrap();
+        let server_socket = client_handle.await.unwrap();
+
+        let mut transport = RfbTransport::Tcp(server_socket);
+        let mut send_buf = BytesMut::with_capacity(65536);
+        let fb = SharedFramebuffer::new(64, 64);
+        let format = PixelFormat::bgra32();
+        let metrics = MetricsRegistry::new();
+
+        let mut client_w = 64;
+        let mut client_h = 64;
+
+        // Framebuffer resized to 128x128 on server, but client DOES NOT support DesktopSize
+        {
+            let mut fb_guard = fb.inner.write();
+            fb_guard.resize(128, 128);
+        }
+        fb.notify_damage();
+
+        let sent = send_framebuffer_update_stream(
+            &mut transport,
+            &mut send_buf,
+            &fb,
+            &format,
+            false,
+            false,
+            false, // no LastRect
+            false, // no DesktopSize support!
+            &mut client_w,
+            &mut client_h,
+            None,
+            true,
+            &metrics,
+        )
+        .await
+        .unwrap();
+
+        assert!(sent);
+        // Client width and height must remain 64x64
+        assert_eq!(client_w, 64);
+        assert_eq!(client_h, 64);
+
+        let mut recv_buf = vec![0u8; send_buf.len()];
+        client_socket.read_exact(&mut recv_buf).await.unwrap();
+        assert_eq!(recv_buf[0], SERVER_MSG_FRAMEBUFFER_UPDATE);
+
+        // Only 1 tile inside (0, 0, 64, 64) is sent (not 4 tiles)
+        let num_rects = u16::from_be_bytes([recv_buf[2], recv_buf[3]]);
+        assert_eq!(num_rects, 1);
+
+        let header = UpdateRectHeader::parse(&recv_buf[4..16]).unwrap();
+        assert_eq!(header.rect, Rect::new(0, 0, 64, 64));
+    }
+
+    #[tokio::test]
+    async fn test_rfb_handshake_versions_and_continuous_updates() {
+        use crate::input::InputRouter;
+        use tokio_util::sync::CancellationToken;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let cancel = CancellationToken::new();
+        let cancel_child = cancel.child_token();
+
+        let server_task = tokio::spawn(async move {
+            let (socket, peer_addr) = listener.accept().await.unwrap();
+            let engine = RfbProtocolEngine::new(
+                1,
+                peer_addr,
+                RfbTransport::Tcp(socket),
+                SharedFramebuffer::new(64, 64),
+                InputRouter::new(),
+                "TestDesktop".to_string(),
+                None,
+                cancel_child,
+            );
+            let _ = engine.run().await;
+        });
+
+        let mut client_socket = TcpStream::connect(addr).await.unwrap();
+
+        // 1. Read Server Version (RFB 003.008\n)
+        let mut ver_buf = [0u8; 12];
+        client_socket.read_exact(&mut ver_buf).await.unwrap();
+        assert_eq!(&ver_buf, RFB_VERSION_3_8);
+
+        // 2. Client sends RFB 003.008\n
+        client_socket.write_all(RFB_VERSION_3_8).await.unwrap();
+
+        // 3. Server sends [1, SECURITY_TYPE_NONE]
+        let mut sec_types = [0u8; 2];
+        client_socket.read_exact(&mut sec_types).await.unwrap();
+        assert_eq!(sec_types, [1, SECURITY_TYPE_NONE]);
+
+        // 4. Client selects SECURITY_TYPE_NONE
+        client_socket.write_all(&[SECURITY_TYPE_NONE]).await.unwrap();
+
+        // 5. Server sends SecurityResult OK (4 bytes 0)
+        let mut sec_res = [0u8; 4];
+        client_socket.read_exact(&mut sec_res).await.unwrap();
+        assert_eq!(sec_res, [0, 0, 0, 0]);
+
+        // 6. Client sends ClientInit (shared = 1)
+        client_socket.write_all(&[1]).await.unwrap();
+
+        // 7. Server sends ServerInit (24 bytes + 11 name bytes)
+        let mut init_hdr = [0u8; 24];
+        client_socket.read_exact(&mut init_hdr).await.unwrap();
+        let name_len = u32::from_be_bytes([init_hdr[20], init_hdr[21], init_hdr[22], init_hdr[23]]) as usize;
+        let mut name_buf = vec![0u8; name_len];
+        client_socket.read_exact(&mut name_buf).await.unwrap();
+        assert_eq!(&name_buf, b"TestDesktop");
+
+        // 8. Client sends EnableContinuousUpdates (enable = false)
+        let mut disable_msg = vec![CLIENT_MSG_ENABLE_CONTINUOUS_UPDATES, 0];
+        disable_msg.extend_from_slice(&0u16.to_be_bytes()); // x
+        disable_msg.extend_from_slice(&0u16.to_be_bytes()); // y
+        disable_msg.extend_from_slice(&64u16.to_be_bytes()); // w
+        disable_msg.extend_from_slice(&64u16.to_be_bytes()); // h
+        client_socket.write_all(&disable_msg).await.unwrap();
+
+        // 9. Server must acknowledge with EndOfContinuousUpdates (message type 150)
+        let mut end_msg = [0u8; 1];
+        client_socket.read_exact(&mut end_msg).await.unwrap();
+        assert_eq!(end_msg[0], SERVER_MSG_END_OF_CONTINUOUS_UPDATES);
+
+        cancel.cancel();
+        let _ = server_task.await;
     }
 }

@@ -155,6 +155,7 @@ impl AppConfig {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn from_start_args_full(
         display_str: &str,
         resolution_str: &str,
@@ -179,13 +180,7 @@ impl AppConfig {
                 .collect::<Vec<String>>()
         });
 
-        let effective_manage_x11 = if attach {
-            false
-        } else if manage_x11 {
-            true
-        } else {
-            true
-        };
+        let effective_manage_x11 = !attach && manage_x11;
 
         Self {
             display_num,
