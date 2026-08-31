@@ -39,6 +39,16 @@ pub const CLIENT_MSG_KEY_EVENT: u8 = 4;
 pub const CLIENT_MSG_POINTER_EVENT: u8 = 5;
 pub const CLIENT_MSG_CLIENT_CUT_TEXT: u8 = 6;
 pub const CLIENT_MSG_ENABLE_CONTINUOUS_UPDATES: u8 = 150;
+/// Live capture FPS on the RFB session (Display vnc.html sends this; 4 bytes).
+pub const CLIENT_MSG_SET_FPS: u8 = 254;
+
+/// Slider range for live SetFps. Initial `--fps` (CLI default 60) is not clamped.
+pub const LIVE_FPS_MIN: u32 = 1;
+pub const LIVE_FPS_MAX: u32 = 30;
+
+pub fn clamp_live_fps(fps: u32) -> u32 {
+    fps.clamp(LIVE_FPS_MIN, LIVE_FPS_MAX)
+}
 
 // Server-to-Client Message IDs
 pub const SERVER_MSG_FRAMEBUFFER_UPDATE: u8 = 0;
@@ -56,6 +66,7 @@ pub enum ClientMessage {
     PointerEvent { button_mask: u8, x: u16, y: u16 },
     ClientCutText(String),
     EnableContinuousUpdates { enable: bool, rect: Rect },
+    SetFps { fps: u32 },
 }
 
 impl ClientMessage {
@@ -166,6 +177,15 @@ impl ClientMessage {
                     enable,
                     rect: Rect::new(x, y, width, height),
                 }))
+            }
+            CLIENT_MSG_SET_FPS => {
+                // u8 type=254, u8 pad=0, u16 fps big-endian. 4 bytes total.
+                if buf.len() < 4 {
+                    return Ok(None);
+                }
+                let fps = u16::from_be_bytes([buf[2], buf[3]]) as u32;
+                buf.advance(4);
+                Ok(Some(ClientMessage::SetFps { fps }))
             }
             unknown => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -306,7 +326,8 @@ mod tests {
         assert_eq!(parsed.encoding, PSEUDO_ENCODING_LAST_RECT);
 
         // DesktopSize (-223)
-        let dt_size = UpdateRectHeader::new(Rect::new(0, 0, 1920, 1080), PSEUDO_ENCODING_DESKTOP_SIZE);
+        let dt_size =
+            UpdateRectHeader::new(Rect::new(0, 0, 1920, 1080), PSEUDO_ENCODING_DESKTOP_SIZE);
         let bytes = dt_size.to_bytes();
         let parsed = UpdateRectHeader::parse(&bytes).unwrap();
         assert_eq!(parsed.rect.width, 1920);
@@ -324,10 +345,15 @@ mod tests {
         buf.put_i32(ENCODING_TIGHT);
         buf.put_i32(PSEUDO_ENCODING_LAST_RECT);
 
-        let msg = ClientMessage::parse(&mut buf).unwrap().expect("parsed message");
+        let msg = ClientMessage::parse(&mut buf)
+            .unwrap()
+            .expect("parsed message");
         match msg {
             ClientMessage::SetEncodings(encs) => {
-                assert_eq!(encs, vec![ENCODING_RAW, ENCODING_TIGHT, PSEUDO_ENCODING_LAST_RECT]);
+                assert_eq!(
+                    encs,
+                    vec![ENCODING_RAW, ENCODING_TIGHT, PSEUDO_ENCODING_LAST_RECT]
+                );
             }
             _ => panic!("Unexpected message type"),
         }
@@ -343,7 +369,9 @@ mod tests {
         buf.put_u16(1920); // w
         buf.put_u16(1080); // h
 
-        let msg = ClientMessage::parse(&mut buf).unwrap().expect("parsed message");
+        let msg = ClientMessage::parse(&mut buf)
+            .unwrap()
+            .expect("parsed message");
         match msg {
             ClientMessage::FramebufferUpdateRequest { incremental, rect } => {
                 assert!(incremental);
@@ -373,7 +401,13 @@ mod tests {
         buf.put_u16(0); // pad
         buf.put_u32(0xFF08); // backspace
         let msg = ClientMessage::parse(&mut buf).unwrap().unwrap();
-        assert_eq!(msg, ClientMessage::KeyEvent { down: true, key_sym: 0xFF08 });
+        assert_eq!(
+            msg,
+            ClientMessage::KeyEvent {
+                down: true,
+                key_sym: 0xFF08
+            }
+        );
 
         // Pointer Event
         buf.clear();
@@ -382,7 +416,14 @@ mod tests {
         buf.put_u16(100);
         buf.put_u16(200);
         let msg = ClientMessage::parse(&mut buf).unwrap().unwrap();
-        assert_eq!(msg, ClientMessage::PointerEvent { button_mask: 1, x: 100, y: 200 });
+        assert_eq!(
+            msg,
+            ClientMessage::PointerEvent {
+                button_mask: 1,
+                x: 100,
+                y: 200
+            }
+        );
 
         // Client Cut Text
         buf.clear();
@@ -409,10 +450,13 @@ mod tests {
         buf.put_u16(800);
         buf.put_u16(600);
         let msg = ClientMessage::parse(&mut buf).unwrap().unwrap();
-        assert_eq!(msg, ClientMessage::EnableContinuousUpdates {
-            enable: true,
-            rect: Rect::new(0, 0, 800, 600),
-        });
+        assert_eq!(
+            msg,
+            ClientMessage::EnableContinuousUpdates {
+                enable: true,
+                rect: Rect::new(0, 0, 800, 600),
+            }
+        );
     }
 
     #[test]
@@ -425,5 +469,56 @@ mod tests {
         assert_eq!(len, text.len());
         assert_eq!(&bytes[8..], text.as_bytes());
     }
-}
 
+    #[test]
+    fn test_client_message_parse_set_fps_type_254() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(CLIENT_MSG_SET_FPS);
+        buf.put_u8(0);
+        buf.put_u16(15);
+        let msg = ClientMessage::parse(&mut buf).unwrap().unwrap();
+        assert_eq!(msg, ClientMessage::SetFps { fps: 15 });
+        assert!(buf.is_empty());
+
+        // Incomplete (3 bytes) must wait, not error.
+        buf.clear();
+        buf.put_u8(CLIENT_MSG_SET_FPS);
+        buf.put_u8(0);
+        buf.put_u8(0);
+        assert!(ClientMessage::parse(&mut buf).unwrap().is_none());
+
+        buf.clear();
+        buf.put_u8(CLIENT_MSG_SET_FPS);
+        buf.put_u8(0);
+        buf.put_u16(0);
+        assert_eq!(
+            ClientMessage::parse(&mut buf).unwrap().unwrap(),
+            ClientMessage::SetFps { fps: 0 }
+        );
+
+        buf.clear();
+        buf.put_u8(CLIENT_MSG_SET_FPS);
+        buf.put_u8(0);
+        buf.put_u16(60);
+        assert_eq!(
+            ClientMessage::parse(&mut buf).unwrap().unwrap(),
+            ClientMessage::SetFps { fps: 60 }
+        );
+
+        // Unknown types still fail (do not overload ClientCutText).
+        buf.clear();
+        buf.put_u8(253);
+        assert!(ClientMessage::parse(&mut buf).is_err());
+    }
+
+    #[test]
+    fn test_clamp_live_fps_slider_range() {
+        assert_eq!(clamp_live_fps(0), 1);
+        assert_eq!(clamp_live_fps(1), 1);
+        assert_eq!(clamp_live_fps(15), 15);
+        assert_eq!(clamp_live_fps(30), 30);
+        assert_eq!(clamp_live_fps(31), 30);
+        assert_eq!(clamp_live_fps(60), 30);
+        assert_eq!(clamp_live_fps(u32::MAX), 30);
+    }
+}

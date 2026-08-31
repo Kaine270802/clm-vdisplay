@@ -2,7 +2,8 @@ use crate::display::framebuffer::SharedFramebuffer;
 use crate::input::InputRouter;
 use crate::rfb::engine::{RfbProtocolEngine, RfbTransport};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -18,6 +19,7 @@ pub struct WsRfbServer {
     pub framebuffer: SharedFramebuffer,
     pub input_router: InputRouter,
     pub cancel_token: CancellationToken,
+    pub capture_fps: Arc<AtomicU32>,
 }
 
 impl WsRfbServer {
@@ -28,6 +30,7 @@ impl WsRfbServer {
         framebuffer: SharedFramebuffer,
         input_router: InputRouter,
         cancel_token: CancellationToken,
+        capture_fps: Arc<AtomicU32>,
     ) -> Self {
         Self {
             bind_addr,
@@ -36,6 +39,7 @@ impl WsRfbServer {
             framebuffer,
             input_router,
             cancel_token,
+            capture_fps,
         }
     }
 
@@ -64,11 +68,22 @@ impl WsRfbServer {
                             let name = self.desktop_name.clone();
                             let token = self.auth_token.clone();
                             let cancel = self.cancel_token.child_token();
+                            let capture_fps = self.capture_fps.clone();
 
                             tokio::spawn(async move {
                                 if let Err(e) = handle_ws_accept(
-                                    client_id, stream, peer_addr, fb, input, name, token, cancel
-                                ).await {
+                                    client_id,
+                                    stream,
+                                    peer_addr,
+                                    fb,
+                                    input,
+                                    name,
+                                    token,
+                                    cancel,
+                                    capture_fps,
+                                )
+                                .await
+                                {
                                     info!("WebSocket client #{} disconnected: {}", client_id, e);
                                 }
                             });
@@ -96,6 +111,7 @@ async fn handle_ws_accept(
     desktop_name: String,
     auth_token: Option<String>,
     cancel_token: CancellationToken,
+    capture_fps: Arc<AtomicU32>,
 ) -> anyhow::Result<()> {
     let token_clone = auth_token.clone();
     let callback = move |req: &Request,
@@ -150,7 +166,8 @@ async fn handle_ws_accept(
         desktop_name,
         auth_token,
         cancel_token,
-    );
+    )
+    .with_capture_fps(capture_fps);
 
     engine.run().await
 }

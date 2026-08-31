@@ -2,7 +2,7 @@
 
 Rust engine for a **headed X11 virtual display** plus **RFB 3.8** (native TCP and WebSocket). CloakBrowser Gateway on Hugging Face Space spawns one process per browser session instead of `x11vnc` + websockify.
 
-This README matches the tree at `b9dbb4371e22d6dec5ee85a11c808315e1f604c9` (and later commits on `main`). Marketing numbers that are not measured here are omitted.
+This README matches the behavior of this tree. Marketing numbers that are not measured here are omitted.
 
 ---
 
@@ -11,14 +11,14 @@ This README matches the tree at `b9dbb4371e22d6dec5ee85a11c808315e1f604c9` (and 
 - Supervises **Xvfb** (`--manage-x11`) with MIT-SHM + XDamage capture.
 - Speaks RFB 3.8 to noVNC / Tight clients: **Tight (zlib lossless)** → ZRLE → RAW.
 - Injects **mouse and keyboard** into X11 with **XTest** (must finish attaching before RFB input; fire-and-forget injector was a past bug).
-- Caps capture with `--fps` (CLI default **60**; **Gateway Space passes `--fps 15`**).
+- Caps capture with `--fps` (CLI default **60**; **Gateway Space passes `--fps 15`**). Live change: RFB client message **SetFps** (type **254**, 4 bytes: `u8 type`, `u8 pad=0`, `u16 fps` big-endian) on the open `/vnc/{browserId}` socket of the **`start` process**. Capture loop reads an `AtomicU32` each wait (min 1). Stored live value is clamped to **1..=30** (slider range). Display (`vnc.html`) sends type 254; do not restart RFB.
+- Two-way **text** clipboard: RFB `ClientCutText` → X11 **CLIPBOARD** and **PRIMARY** (XFixes / ICCCM owner) so Chrome Ctrl+V works; XFixes `SelectionNotify` on CLIPBOARD → `ServerCutText`. Applied text is capped at **256 KiB** (truncate + log; RFB session stays up). Parse ceiling 10 MiB is unchanged. Images/files are not supported.
 - Optional Prometheus `--metrics-port` (`/health`, `/metrics`). Gateway spawn **does not** pass `--metrics-port`.
 
 ## What it does not do (yet)
 
 - **WebRTC**: Cargo feature `webrtc` is an empty stub. Do not enable for product.
-- **X11 CLIPBOARD bridge**: `ClipboardManager` stores RFB `ClientCutText` / `ServerCutText` in RAM. Chrome in Xvfb pastes from the X11 clipboard, so OS copy/paste through noVNC is **not** equivalent to a real shared clipboard. Gateway UI still uses a Paste Text workaround that types keys.
-- **Live FPS change**: `--fps` is applied when the capture loop starts. There is no SetFps on the supervisor socket.
+- **Supervisor Unix socket as the Space FPS path**: Gateway does **not** run `daemon`. Optional `SupervisorCommand::SetFps` exists for tests only. Live FPS is RFB SetFps on `start`.
 - **Proven &lt;15 MB RSS / &lt;10 ms photon**: not measured on cpu-basic Space. Headed Chrome on the same display dominates RAM (~250 MiB parent); VNC encode did not move cgroup memory in Gateway tests.
 
 ---
@@ -60,7 +60,7 @@ clm-vdisplay daemon \
   --control-socket /tmp/clm-vdisplay.sock
 ```
 
-IPC actions today: Create / Stop / List / Get / InjectText / SetClipboard. **No SetFps.** Gateway does **not** run this daemon; it `start`s one binary per session.
+IPC actions: Create / Stop / List / Get / InjectText / SetClipboard / SetFps (tests). **Gateway does not run this daemon**; it `start`s one binary per session. Live FPS for Space is RFB type 254, not this socket.
 
 ---
 
@@ -71,8 +71,8 @@ src/
   config.rs          # clap: start --fps, --manage-x11, …
   display/           # framebuffer, x11 session glue
   rfb/               # engine, encoder (Tight/ZRLE/RAW), tcp + ws servers
-  input/             # mouse, keyboard, in-memory clipboard
-  x11/               # capture, XTest injector, Xvfb supervisor
+  input/             # mouse, keyboard, in-memory clipboard (256 KiB cap)
+  x11/               # capture, XTest injector, XFixes CLIPBOARD, Xvfb supervisor
   server/            # DisplaySession, optional daemon supervisor
   streaming/         # webrtc stub, cdp_pipe
 ```

@@ -1,7 +1,8 @@
 use crate::display::framebuffer::SharedFramebuffer;
 use crate::x11::shm::ShmSegment;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -91,6 +92,15 @@ const IDLE_POLL_MAX: Duration = Duration::from_millis(25);
 /// Minimum interval between event-queue polls (keeps CPU near zero when idle).
 const IDLE_POLL_MIN: Duration = Duration::from_millis(2);
 
+/// Recompute capture pacing from a live FPS cap (min 1). Called each wait.
+pub fn frame_pacing_from_fps(fps: u32) -> Duration {
+    Duration::from_nanos((1_000_000_000u64 / (fps.max(1) as u64)).max(1_000_000))
+}
+
+fn load_fps(fps: &AtomicU32) -> u32 {
+    fps.load(Ordering::Relaxed).max(1)
+}
+
 impl X11CaptureEngine {
     pub fn new(display_num: u32, width: u32, height: u32) -> Self {
         Self {
@@ -104,7 +114,7 @@ impl X11CaptureEngine {
     pub fn start_capture_loop(
         self,
         framebuffer: SharedFramebuffer,
-        fps: u32,
+        fps: Arc<AtomicU32>,
         cancel_token: CancellationToken,
     ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
         // Run the whole capture pipeline on the blocking thread-pool so the
@@ -124,18 +134,15 @@ impl X11CaptureEngine {
     pub async fn run_capture_loop(
         self,
         framebuffer: SharedFramebuffer,
-        fps: u32,
+        fps: Arc<AtomicU32>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
         let display_str = format!(":{}", self.display_num);
-        // Minimum spacing between captures (fps cap).
-        let frame_pacing = Duration::from_nanos((1_000_000_000u64 / (fps.max(1) as u64)).max(1_000_000));
+        let initial_fps = load_fps(&fps);
 
         info!(
-            "X11CaptureEngine (damage-event-driven) started for display {} (fps cap {}, pacing {:?})",
-            display_str,
-            fps.max(1),
-            frame_pacing
+            "X11CaptureEngine (damage-event-driven) started for display {} (fps cap {}, live AtomicU32)",
+            display_str, initial_fps
         );
 
         while !cancel_token.is_cancelled() {
@@ -249,7 +256,7 @@ impl X11CaptureEngine {
             // First frame is always captured immediately so clients see content
             // even while the screen stays static.
             let mut needs_capture = true;
-            let mut last_capture = Instant::now() - frame_pacing;
+            let mut last_capture = Instant::now() - frame_pacing_from_fps(load_fps(&fps));
             let mut idle_poll = IDLE_POLL_MIN;
 
             loop {
@@ -321,6 +328,9 @@ impl X11CaptureEngine {
 
                         // Enforce the fps cap between *successful* captures.
                         // Failed grabs must not consume a frame slot.
+                        // Recompute from the live atomic each wait (SetFps / --fps seed).
+                        let fps_now = load_fps(&fps);
+                        let frame_pacing = frame_pacing_from_fps(fps_now);
                         if last_capture.elapsed() < frame_pacing {
                             continue;
                         }
@@ -451,7 +461,7 @@ impl X11CaptureEngine {
                         }
 
                         // E. X11 connection broken -> reconnect.
-                        if consecutive_errors >= (fps.max(1) * 2).max(8) {
+                        if consecutive_errors >= fps_now.saturating_mul(2).max(8) {
                             warn!(
                                 "X11 connection broken on {} ({} consecutive errors), reconnecting...",
                                 display_str, consecutive_errors
@@ -517,5 +527,18 @@ mod tests {
         assert_eq!(dirty.max_y, 210);
 
         assert_eq!(tracker.take_dirty(), None);
+    }
+
+    #[test]
+    fn test_frame_pacing_recomputes_from_atomic() {
+        let fps = AtomicU32::new(15);
+        let p15 = frame_pacing_from_fps(load_fps(&fps));
+        fps.store(30, Ordering::Relaxed);
+        let p30 = frame_pacing_from_fps(load_fps(&fps));
+        assert!(p30 < p15);
+        assert_eq!(p15, Duration::from_nanos(1_000_000_000 / 15));
+        fps.store(0, Ordering::Relaxed);
+        let pmin = frame_pacing_from_fps(load_fps(&fps));
+        assert_eq!(pmin, Duration::from_nanos(1_000_000_000));
     }
 }

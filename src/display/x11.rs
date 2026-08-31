@@ -1,9 +1,12 @@
 use crate::display::framebuffer::SharedFramebuffer;
+use crate::input::ClipboardManager;
 use crate::x11::capture::X11CaptureEngine;
+use crate::x11::clipboard::start_clipboard_bridge;
 use crate::x11::input::X11InputInjector;
 use crate::x11::supervisor::{X11ProcessGuard, X11Supervisor};
 use parking_lot::Mutex;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -41,13 +44,14 @@ impl HeadlessX11Server {
         }
     }
 
-    /// Initialize the X11 server instance, MIT-SHM capture loop, and XTest input injection
+    /// Initialize the X11 server instance, MIT-SHM capture loop, XTest, and CLIPBOARD
     pub async fn initialize(
         &self,
         manage_x11: bool,
         xvfb_path: Option<String>,
         xvfb_args: Option<Vec<String>>,
-        fps: u32,
+        fps: Arc<AtomicU32>,
+        clipboard: Arc<ClipboardManager>,
         cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
         info!("Initializing Headless X11 Server on :{}", self.display_num);
@@ -111,6 +115,20 @@ impl HeadlessX11Server {
             }
         }
 
+        // 4. XFixes CLIPBOARD bridge — wait until the agent window is subscribed
+        //    (same race class as the old injector bug if this were fire-and-forget).
+        match start_clipboard_bridge(self.display_num, clipboard, cancel_token.child_token()).await
+        {
+            Ok(()) => info!(
+                "X11 CLIPBOARD bridge ready on display :{}",
+                self.display_num
+            ),
+            Err(e) => error!(
+                "X11 CLIPBOARD bridge failed on display :{}: {} (Ctrl+V into Chrome will be empty)",
+                self.display_num, e
+            ),
+        }
+
         Ok(())
     }
 
@@ -120,15 +138,7 @@ impl HeadlessX11Server {
     }
 
     /// Auto-maximize client window and update frame
-    pub fn update_window_buffer(
-        &self,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-        data: &[u8],
-        stride: usize,
-    ) {
+    pub fn update_window_buffer(&self, x: u32, y: u32, w: u32, h: u32, data: &[u8], stride: usize) {
         {
             let mut fb = self.framebuffer.inner.write();
             fb.update_rect(x, y, w, h, data, stride);

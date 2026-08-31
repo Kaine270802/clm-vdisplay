@@ -7,6 +7,7 @@ use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -102,6 +103,7 @@ pub struct RfbProtocolEngine {
     pub auth_token: Option<String>,
     pub cancel_token: CancellationToken,
     pub metrics: Arc<MetricsRegistry>,
+    pub capture_fps: Arc<AtomicU32>,
 }
 
 impl RfbProtocolEngine {
@@ -126,7 +128,13 @@ impl RfbProtocolEngine {
             auth_token,
             cancel_token,
             metrics: GLOBAL_METRICS.clone(),
+            capture_fps: Arc::new(AtomicU32::new(60)),
         }
+    }
+
+    pub fn with_capture_fps(mut self, capture_fps: Arc<AtomicU32>) -> Self {
+        self.capture_fps = capture_fps;
+        self
     }
 
     /// Run full RFB 3.8 handshake and client session loop
@@ -323,6 +331,14 @@ impl RfbProtocolEngine {
                             ClientMessage::ClientCutText(text) => {
                                 self.input_router.clipboard.set_from_client(text);
                             }
+                            ClientMessage::SetFps { fps } => {
+                                let clamped = clamp_live_fps(fps);
+                                self.capture_fps.store(clamped, Ordering::Relaxed);
+                                info!(
+                                    "Client #{} SetFps {} → live cap {}",
+                                    self.client_id, fps, clamped
+                                );
+                            }
                             ClientMessage::EnableContinuousUpdates { enable, rect } => {
                                 continuous_updates = enable;
                                 if enable {
@@ -407,8 +423,8 @@ async fn send_framebuffer_update_stream(
         (cur_w, cur_h, fb.detect_damage_tiles())
     };
 
-    let size_changed =
-        (current_width != *client_width || current_height != *client_height) && supports_desktop_size;
+    let size_changed = (current_width != *client_width || current_height != *client_height)
+        && supports_desktop_size;
 
     let client_bounds = Rect::new(0, 0, *client_width, *client_height);
     let filtered_rects: Vec<Rect> = if let Some(req) = target_rect {
@@ -538,7 +554,7 @@ mod tests {
 
         assert_eq!(recv_buf[0], SERVER_MSG_FRAMEBUFFER_UPDATE);
         assert_eq!(recv_buf[1], 0); // pad
-        // 4 tiles (128x128 = 2x2 of 64x64) + 1 LastRect = 5 rects
+                                    // 4 tiles (128x128 = 2x2 of 64x64) + 1 LastRect = 5 rects
         let num_rects = u16::from_be_bytes([recv_buf[2], recv_buf[3]]);
         assert_eq!(num_rects, 5);
 
@@ -708,7 +724,10 @@ mod tests {
         assert_eq!(sec_types, [1, SECURITY_TYPE_NONE]);
 
         // 4. Client selects SECURITY_TYPE_NONE
-        client_socket.write_all(&[SECURITY_TYPE_NONE]).await.unwrap();
+        client_socket
+            .write_all(&[SECURITY_TYPE_NONE])
+            .await
+            .unwrap();
 
         // 5. Server sends SecurityResult OK (4 bytes 0)
         let mut sec_res = [0u8; 4];
@@ -721,7 +740,8 @@ mod tests {
         // 7. Server sends ServerInit (24 bytes + 11 name bytes)
         let mut init_hdr = [0u8; 24];
         client_socket.read_exact(&mut init_hdr).await.unwrap();
-        let name_len = u32::from_be_bytes([init_hdr[20], init_hdr[21], init_hdr[22], init_hdr[23]]) as usize;
+        let name_len =
+            u32::from_be_bytes([init_hdr[20], init_hdr[21], init_hdr[22], init_hdr[23]]) as usize;
         let mut name_buf = vec![0u8; name_len];
         client_socket.read_exact(&mut name_buf).await.unwrap();
         assert_eq!(&name_buf, b"TestDesktop");

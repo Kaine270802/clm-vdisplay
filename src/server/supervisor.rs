@@ -48,6 +48,11 @@ pub enum SupervisorCommand {
         display_num: u32,
         text: String,
     },
+    /// Test/daemon only — Space live FPS is RFB SetFps on `start`, not this socket.
+    SetFps {
+        display_num: u32,
+        fps: u32,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -413,6 +418,29 @@ async fn handle_ipc_client(
                     }
                 }
             }
+            Ok(SupervisorCommand::SetFps { display_num, fps }) => {
+                let session_arc = {
+                    let guard = displays.read();
+                    guard.get(&display_num).cloned()
+                };
+                if let Some(s) = session_arc {
+                    let guard = s.lock().await;
+                    let applied = guard.apply_live_fps(fps);
+                    SupervisorResponse {
+                        success: true,
+                        message: Some(format!("FPS set to {}", applied)),
+                        displays: None,
+                        display: None,
+                    }
+                } else {
+                    SupervisorResponse {
+                        success: false,
+                        message: Some("Display not found".to_string()),
+                        displays: None,
+                        display: None,
+                    }
+                }
+            }
             Err(e) => SupervisorResponse {
                 success: false,
                 message: Some(format!("Invalid command payload: {}", e)),
@@ -430,4 +458,45 @@ async fn handle_ipc_client(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rfb::message::clamp_live_fps;
+    use crate::server::session::DisplaySession;
+
+    #[test]
+    fn test_supervisor_set_fps_command_parse() {
+        let json = r#"{"action":"set_fps","display_num":100,"fps":20}"#;
+        let cmd: SupervisorCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            SupervisorCommand::SetFps { display_num, fps } => {
+                assert_eq!(display_num, 100);
+                assert_eq!(fps, 20);
+            }
+            _ => panic!("expected SetFps"),
+        }
+    }
+
+    #[test]
+    fn test_session_apply_live_fps_clamps() {
+        let session = DisplaySession::new(SessionConfig::default());
+        assert_eq!(session.apply_live_fps(0), 1);
+        assert_eq!(
+            session
+                .capture_fps
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(session.apply_live_fps(60), 30);
+        assert_eq!(
+            session
+                .capture_fps
+                .load(std::sync::atomic::Ordering::Relaxed),
+            30
+        );
+        assert_eq!(clamp_live_fps(15), 15);
+        assert_eq!(session.apply_live_fps(15), 15);
+    }
 }

@@ -2,7 +2,8 @@ use crate::display::framebuffer::SharedFramebuffer;
 use crate::input::InputRouter;
 use crate::rfb::engine::{RfbProtocolEngine, RfbTransport};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
@@ -17,6 +18,7 @@ pub struct TcpRfbServer {
     pub framebuffer: SharedFramebuffer,
     pub input_router: InputRouter,
     pub cancel_token: CancellationToken,
+    pub capture_fps: Arc<AtomicU32>,
 }
 
 impl TcpRfbServer {
@@ -27,6 +29,7 @@ impl TcpRfbServer {
         framebuffer: SharedFramebuffer,
         input_router: InputRouter,
         cancel_token: CancellationToken,
+        capture_fps: Arc<AtomicU32>,
     ) -> Self {
         Self {
             bind_addr,
@@ -35,6 +38,7 @@ impl TcpRfbServer {
             framebuffer,
             input_router,
             cancel_token,
+            capture_fps,
         }
     }
 
@@ -67,7 +71,8 @@ impl TcpRfbServer {
                                 self.desktop_name.clone(),
                                 self.auth_token.clone(),
                                 self.cancel_token.child_token(),
-                            );
+                            )
+                            .with_capture_fps(self.capture_fps.clone());
 
                             tokio::spawn(async move {
                                 if let Err(e) = engine.run().await {

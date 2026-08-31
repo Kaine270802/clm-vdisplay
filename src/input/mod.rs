@@ -4,7 +4,7 @@ pub mod clipboard;
 pub mod keyboard;
 pub mod mouse;
 
-pub use clipboard::ClipboardManager;
+pub use clipboard::{cap_clipboard_text, ClipboardManager, CLIPBOARD_TEXT_CAP};
 pub use keyboard::{KeyAction, KeyboardRouter, ModifierState};
 pub use mouse::{
     MouseAction, MouseRouter, MouseState, MOUSE_BTN_LEFT, MOUSE_BTN_MIDDLE, MOUSE_BTN_RIGHT,

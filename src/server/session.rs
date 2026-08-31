@@ -4,6 +4,7 @@ use crate::input::InputRouter;
 use crate::rfb::{TcpRfbServer, WsRfbServer};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -77,6 +78,8 @@ pub struct DisplaySession {
     pub xvfb_path: String,
     pub xvfb_args: Option<Vec<String>>,
     pub fps: u32,
+    /// Live capture cap (seeded by `--fps`, updated by RFB SetFps). Min 1.
+    pub capture_fps: Arc<AtomicU32>,
     tcp_handle: Option<JoinHandle<()>>,
     ws_handle: Option<JoinHandle<()>>,
 }
@@ -92,7 +95,7 @@ impl DisplaySession {
         session.attach = cfg.attach;
         session.xvfb_path = cfg.xvfb_path.clone();
         session.xvfb_args = cfg.xvfb_args.clone();
-        session.fps = cfg.fps;
+        session.seed_capture_fps(cfg.fps);
         session
     }
 
@@ -120,6 +123,7 @@ impl DisplaySession {
             xvfb_path: "Xvfb".to_string(),
             xvfb_args: None,
             fps: 60,
+            capture_fps: Arc::new(AtomicU32::new(60)),
             tcp_handle: None,
             ws_handle: None,
         }
@@ -137,7 +141,20 @@ impl DisplaySession {
         self.attach = attach;
         self.xvfb_path = xvfb_path;
         self.xvfb_args = xvfb_args;
+        self.seed_capture_fps(fps);
+    }
+
+    fn seed_capture_fps(&mut self, fps: u32) {
+        let fps = fps.max(1);
         self.fps = fps;
+        self.capture_fps.store(fps, Ordering::Relaxed);
+    }
+
+    /// Test / daemon helper: clamp to live slider range 1..=30 and store.
+    pub fn apply_live_fps(&self, fps: u32) -> u32 {
+        let clamped = crate::rfb::message::clamp_live_fps(fps);
+        self.capture_fps.store(clamped, Ordering::Relaxed);
+        clamped
     }
 
     /// Start the VNC and WebSocket servers for this display session
@@ -150,7 +167,8 @@ impl DisplaySession {
                 self.manage_x11,
                 Some(self.xvfb_path.clone()),
                 self.xvfb_args.clone(),
-                self.fps,
+                self.capture_fps.clone(),
+                self.input_router.clipboard.clone(),
                 self.cancel_token.child_token(),
             )
             .await?;
@@ -184,6 +202,7 @@ impl DisplaySession {
             self.display.framebuffer.clone(),
             self.input_router.clone(),
             self.cancel_token.child_token(),
+            self.capture_fps.clone(),
         );
 
         let tcp_task = tokio::spawn(async move {
@@ -204,6 +223,7 @@ impl DisplaySession {
                 self.display.framebuffer.clone(),
                 self.input_router.clone(),
                 self.cancel_token.child_token(),
+                self.capture_fps.clone(),
             );
 
             let ws_task = tokio::spawn(async move {

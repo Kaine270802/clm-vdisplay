@@ -20,8 +20,8 @@ pub use metrics::{MetricsRegistry, MetricsServer, GLOBAL_METRICS};
 pub use rfb::{RfbProtocolEngine, RfbTransport, TcpRfbServer, WsRfbServer};
 pub use server::{DisplayServer, DisplaySession, DisplaySupervisor, SessionConfig, SessionEvent};
 pub use x11::{
-    DirtyBounds, DirtyTracker, ShmSegment, X11CaptureEngine, X11Detector, X11DisplayState,
-    X11InputInjector, X11ProcessGuard, X11Supervisor,
+    DirtyBounds, DirtyTracker, ShmSegment, X11CaptureEngine, X11ClipboardBridge, X11Detector,
+    X11DisplayState, X11InputInjector, X11ProcessGuard, X11Supervisor,
 };
 
 /// Version of clm-vdisplay engine
