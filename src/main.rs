@@ -111,13 +111,6 @@ async fn main() -> anyhow::Result<()> {
                 "Starting clm-vdisplay on display :{} (resolution={}x{}, mode={}, manage_x11={}, attach={}, fps={})",
                 app_config.display_num, app_config.width, app_config.height, app_config.mode, app_config.manage_x11, app_config.attach, app_config.fps
             );
-            info!(
-                "Listening on TCP RFB (vncviewer) port: 0.0.0.0:{}",
-                app_config.rfb_port
-            );
-            if let Some(ws) = app_config.ws_port {
-                info!("Listening on WebSocket (noVNC) port: 0.0.0.0:{}", ws);
-            }
 
             let cancel_token = CancellationToken::new();
 

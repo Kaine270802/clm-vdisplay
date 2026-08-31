@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// High-level Headless X11 Server integration managing supervisor, capture, and input
 pub struct HeadlessX11Server {
@@ -65,14 +65,24 @@ impl HeadlessX11Server {
         let guard = supervisor.ensure_ready(manage_x11).await?;
         *self.process_guard.lock() = Some(guard);
 
-        // 2. Start MIT-SHM & XDamage 60 FPS capture engine
+        // 2. Start MIT-SHM & XDamage capture engine with background liveness monitoring
         let capture_engine = X11CaptureEngine::new(self.display_num, self.width, self.height);
         let capture_task = capture_engine.start_capture_loop(
             self.framebuffer.clone(),
             fps,
             cancel_token.child_token(),
         );
-        *self.capture_handle.lock() = Some(capture_task);
+        let display_num = self.display_num;
+        tokio::spawn(async move {
+            if let Ok(res) = capture_task.await {
+                if let Err(e) = res {
+                    error!(
+                        "X11CaptureEngine task exited with error on display :{}: {}",
+                        display_num, e
+                    );
+                }
+            }
+        });
 
         // 3. Connect XTest input injector in background
         let display_num = self.display_num;

@@ -103,7 +103,7 @@ impl X11CaptureEngine {
         })
     }
 
-    /// Connect to X11 server and run MIT-SHM 60 FPS capture pipeline with xproto fallback
+    /// Connect to X11 server and run MIT-SHM capture pipeline with xproto fallback and auto-reconnect
     pub async fn run_capture_loop(
         self,
         framebuffer: SharedFramebuffer,
@@ -111,179 +111,226 @@ impl X11CaptureEngine {
         cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
         let display_str = format!(":{}", self.display_num);
-        info!("Connecting X11CaptureEngine to display {}", display_str);
-
-        // 1. Establish connection to X server with retry
-        let (conn, screen_num) = self
-            .connect_with_retry(&display_str, 50, Duration::from_millis(50))
-            .await?;
-        let screen = &conn.setup().roots[screen_num];
-        let root = screen.root;
-
-        // 2. Query and verify MIT-SHM extension
-        let shm_segment = match conn.shm_query_version() {
-            Ok(cookie) => match cookie.reply() {
-                Ok(shm_ver) => {
-                    info!(
-                        "MIT-SHM extension available: v{}.{}",
-                        shm_ver.major_version, shm_ver.minor_version
-                    );
-                    let stride = (self.width * 4) as usize;
-                    let total_size = stride * (self.height as usize);
-                    match ShmSegment::create(&conn, total_size) {
-                        Ok(seg) => {
-                            info!(
-                                "Allocated SysV SHM segment: {} bytes for {}x{}",
-                                total_size, self.width, self.height
-                            );
-                            Some(seg)
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to allocate MIT-SHM segment (falling back to xproto::get_image): {}",
-                                e
-                            );
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "MIT-SHM query version reply failed (falling back to xproto::get_image): {}",
-                        e
-                    );
-                    None
-                }
-            },
-            Err(e) => {
-                warn!(
-                    "MIT-SHM query version request failed (falling back to xproto::get_image): {}",
-                    e
-                );
-                None
-            }
-        };
-
-        // 3. Frame Timing & Pacing Loop (target 60 FPS = 16.66ms interval)
         let frame_pacing_nanos = (1_000_000_000u64 / (fps.max(1) as u64)).max(1_000_000);
         let mut tick_timer = interval(Duration::from_nanos(frame_pacing_nanos));
         tick_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         info!(
-            "X11CaptureEngine started at {} FPS (interval: {:?}) without background polling contention",
+            "X11CaptureEngine started at {} FPS (interval: {:?}) for display {}",
             fps,
-            Duration::from_nanos(frame_pacing_nanos)
+            Duration::from_nanos(frame_pacing_nanos),
+            display_str
         );
 
-        loop {
-            tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    info!("Shutting down X11CaptureEngine for display :{}", self.display_num);
-                    break;
+        while !cancel_token.is_cancelled() {
+            // 1. Establish connection to X server with retry
+            let (conn, screen_num) = match self
+                .connect_with_retry(&display_str, 50, Duration::from_millis(50))
+                .await
+            {
+                Ok(res) => res,
+                Err(e) => {
+                    warn!(
+                        "Failed to connect to X11 display {}: {}. Retrying in 1s...",
+                        display_str, e
+                    );
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                    }
                 }
-                _ = tick_timer.tick() => {
-                    let mut capture_succeeded = false;
+            };
 
-                    // Primary capture path: MIT-SHM DMA from X11 root window
-                    if let Some(ref shm) = shm_segment {
-                        let cookie = conn.shm_get_image(
-                            root,
-                            0,
-                            0,
-                            self.width as u16,
-                            self.height as u16,
-                            !0, // Plane mask: all bitplanes
-                            ImageFormat::Z_PIXMAP.into(),
-                            shm.shmseg,
-                            0,
+            let screen = &conn.setup().roots[screen_num];
+            let root = screen.root;
+
+            // 2. Query and verify MIT-SHM extension
+            let shm_segment = match conn.shm_query_version() {
+                Ok(cookie) => match cookie.reply() {
+                    Ok(shm_ver) => {
+                        info!(
+                            "MIT-SHM extension available: v{}.{} on {}",
+                            shm_ver.major_version, shm_ver.minor_version, display_str
                         );
-
-                        match cookie {
-                            Ok(reply_cookie) => match reply_cookie.reply() {
-                                Ok(_) => {
-                                    let raw_slice = shm.as_slice();
-                                    let has_changes = {
-                                        let mut fb = framebuffer.inner.write();
-                                        fb.update_rect_from_full_frame(
-                                            0,
-                                            0,
-                                            self.width,
-                                            self.height,
-                                            raw_slice,
-                                        );
-                                        fb.has_dirty_tiles()
-                                    };
-                                    if has_changes {
-                                        framebuffer.notify_damage();
-                                    }
-                                    capture_succeeded = true;
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "XShmGetImage reply error on display :{}: {}, falling back to xproto",
-                                        self.display_num, e
-                                    );
-                                }
-                            },
+                        let stride = (self.width * 4) as usize;
+                        let total_size = stride * (self.height as usize);
+                        match ShmSegment::create(&conn, total_size) {
+                            Ok(seg) => {
+                                info!(
+                                    "Allocated SysV SHM segment: {} bytes for {}x{}",
+                                    total_size, self.width, self.height
+                                );
+                                Some(seg)
+                            }
                             Err(e) => {
                                 warn!(
-                                    "XShmGetImage request error on display :{}: {}, falling back to xproto",
-                                    self.display_num, e
+                                    "Failed to allocate MIT-SHM segment (falling back to xproto::get_image): {}",
+                                    e
                                 );
+                                None
                             }
                         }
                     }
+                    Err(e) => {
+                        warn!(
+                            "MIT-SHM query version reply failed (falling back to xproto::get_image): {}",
+                            e
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        "MIT-SHM query version request failed (falling back to xproto::get_image): {}",
+                        e
+                    );
+                    None
+                }
+            };
 
-                    // Fallback capture path: standard xproto get_image
-                    if !capture_succeeded {
-                        match conn.get_image(
-                            ImageFormat::Z_PIXMAP,
-                            root,
-                            0,
-                            0,
-                            self.width as u16,
-                            self.height as u16,
-                            !0,
-                        ) {
-                            Ok(cookie) => match cookie.reply() {
-                                Ok(reply) => {
-                                    let has_changes = {
-                                        let mut fb = framebuffer.inner.write();
-                                        fb.update_rect_from_full_frame(
-                                            0,
-                                            0,
-                                            self.width,
-                                            self.height,
-                                            &reply.data,
+            let mut consecutive_errors: u32 = 0;
+            let mut last_warn_time = std::time::Instant::now();
+
+            loop {
+                tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        info!("Shutting down X11CaptureEngine for display {}", display_str);
+                        if let Some(mut shm) = shm_segment {
+                            shm.detach(&conn);
+                        }
+                        return Ok(());
+                    }
+                    _ = tick_timer.tick() => {
+                        let mut capture_succeeded = false;
+
+                        // Primary capture path: MIT-SHM DMA from X11 root window
+                        if let Some(ref shm) = shm_segment {
+                            let cookie = conn.shm_get_image(
+                                root,
+                                0,
+                                0,
+                                self.width as u16,
+                                self.height as u16,
+                                !0,
+                                ImageFormat::Z_PIXMAP.into(),
+                                shm.shmseg,
+                                0,
+                            );
+
+                            match cookie {
+                                Ok(reply_cookie) => match reply_cookie.reply() {
+                                    Ok(_) => {
+                                        let raw_slice = shm.as_slice();
+                                        let has_changes = {
+                                            let mut fb = framebuffer.inner.write();
+                                            fb.update_rect_from_full_frame(
+                                                0,
+                                                0,
+                                                self.width,
+                                                self.height,
+                                                raw_slice,
+                                            );
+                                            fb.has_dirty_tiles()
+                                        };
+                                        if has_changes {
+                                            framebuffer.notify_damage();
+                                        }
+                                        capture_succeeded = true;
+                                        consecutive_errors = 0;
+                                    }
+                                    Err(e) => {
+                                        consecutive_errors = consecutive_errors.saturating_add(1);
+                                        if last_warn_time.elapsed() >= Duration::from_secs(3) {
+                                            warn!(
+                                                "XShmGetImage reply error on display {}: {}, falling back to xproto",
+                                                display_str, e
+                                            );
+                                            last_warn_time = std::time::Instant::now();
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    consecutive_errors = consecutive_errors.saturating_add(1);
+                                    if last_warn_time.elapsed() >= Duration::from_secs(3) {
+                                        warn!(
+                                            "XShmGetImage request error on display {}: {}, falling back to xproto",
+                                            display_str, e
                                         );
-                                        fb.has_dirty_tiles()
-                                    };
-                                    if has_changes {
-                                        framebuffer.notify_damage();
+                                        last_warn_time = std::time::Instant::now();
                                     }
                                 }
-                                Err(e) => {
-                                    warn!(
-                                        "xproto get_image reply error on display :{}: {}",
-                                        self.display_num, e
-                                    );
-                                }
-                            },
-                            Err(e) => {
-                                warn!(
-                                    "xproto get_image request error on display :{}: {}",
-                                    self.display_num, e
-                                );
                             }
+                        }
+
+                        // Fallback capture path: standard xproto get_image
+                        if !capture_succeeded {
+                            match conn.get_image(
+                                ImageFormat::Z_PIXMAP,
+                                root,
+                                0,
+                                0,
+                                self.width as u16,
+                                self.height as u16,
+                                !0,
+                            ) {
+                                Ok(cookie) => match cookie.reply() {
+                                    Ok(reply) => {
+                                        let has_changes = {
+                                            let mut fb = framebuffer.inner.write();
+                                            fb.update_rect_from_full_frame(
+                                                0,
+                                                0,
+                                                self.width,
+                                                self.height,
+                                                &reply.data,
+                                            );
+                                            fb.has_dirty_tiles()
+                                        };
+                                        if has_changes {
+                                            framebuffer.notify_damage();
+                                        }
+                                        consecutive_errors = 0;
+                                    }
+                                    Err(e) => {
+                                        consecutive_errors = consecutive_errors.saturating_add(1);
+                                        if last_warn_time.elapsed() >= Duration::from_secs(3) {
+                                            warn!(
+                                                "xproto get_image reply error on display {}: {}",
+                                                display_str, e
+                                            );
+                                            last_warn_time = std::time::Instant::now();
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    consecutive_errors = consecutive_errors.saturating_add(1);
+                                    if last_warn_time.elapsed() >= Duration::from_secs(3) {
+                                        warn!(
+                                            "xproto get_image request error on display {}: {}",
+                                            display_str, e
+                                        );
+                                        last_warn_time = std::time::Instant::now();
+                                    }
+                                }
+                            }
+                        }
+
+                        // If X11 connection repeatedly fails (e.g. X server restarted or socket broken), reconnect
+                        if consecutive_errors >= (fps.max(1) * 2) {
+                            warn!(
+                                "X11 connection broken on {} ({} consecutive errors), reconnecting...",
+                                display_str, consecutive_errors
+                            );
+                            if let Some(mut shm) = shm_segment {
+                                shm.detach(&conn);
+                            }
+                            break;
                         }
                     }
                 }
             }
-        }
 
-        // Cleanup
-        if let Some(mut shm) = shm_segment {
-            shm.detach(&conn);
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
         Ok(())
