@@ -8,7 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -208,6 +208,7 @@ impl RfbProtocolEngine {
 
         // Recapture the full screen so a newly connected client does not
         // inherit an empty framebuffer if the first grab failed or ran too early.
+        let gen_at_connect = self.framebuffer.capture_generation();
         self.framebuffer.request_full_capture();
 
         // 5. Client Event & Streaming Loop
@@ -259,6 +260,22 @@ impl RfbProtocolEngine {
                             }
                             ClientMessage::FramebufferUpdateRequest { incremental, rect } => {
                                 if !incremental {
+                                    // noVNC sends a full request immediately after
+                                    // ServerInit. Wait for the connect-time grab so
+                                    // the first frame is not Tight-fill black.
+                                    let deadline = Instant::now() + Duration::from_millis(500);
+                                    while self.framebuffer.capture_generation() <= gen_at_connect
+                                        && Instant::now() < deadline
+                                    {
+                                        let remain = deadline.saturating_duration_since(Instant::now());
+                                        if remain.is_zero() {
+                                            break;
+                                        }
+                                        tokio::select! {
+                                            _ = damage_rx.changed() => {}
+                                            _ = tokio::time::sleep(remain) => {}
+                                        }
+                                    }
                                     send_framebuffer_update_stream(
                                         &mut self.transport,
                                         &mut send_buf,

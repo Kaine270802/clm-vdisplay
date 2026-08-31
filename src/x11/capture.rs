@@ -445,6 +445,7 @@ impl X11CaptureEngine {
                         if capture_succeeded {
                             needs_capture = false;
                             last_capture = Instant::now();
+                            framebuffer.note_capture_complete();
                         } else {
                             needs_capture = true;
                         }

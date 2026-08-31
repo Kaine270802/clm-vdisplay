@@ -653,6 +653,9 @@ pub struct SharedFramebuffer {
     /// Set by RFB clients (and at construction) to force a full-screen grab
     /// before the capture loop waits on XDamage.
     full_capture_requested: Arc<AtomicBool>,
+    /// Incremented after every successful X11 grab. RFB waits on this so
+    /// noVNC's immediate full-frame request does not encode a stale zero buffer.
+    capture_generation: Arc<AtomicU64>,
 }
 
 impl SharedFramebuffer {
@@ -665,6 +668,7 @@ impl SharedFramebuffer {
             notify_rx,
             frame_counter: Arc::new(AtomicU64::new(1)),
             full_capture_requested: Arc::new(AtomicBool::new(true)),
+            capture_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -682,6 +686,16 @@ impl SharedFramebuffer {
     pub fn take_full_capture_request(&self) -> bool {
         self.full_capture_requested.swap(false, Ordering::AcqRel)
     }
+
+    pub fn capture_generation(&self) -> u64 {
+        self.capture_generation.load(Ordering::Acquire)
+    }
+
+    /// Mark that an X11 grab finished so RFB clients can send the first frame.
+    pub fn note_capture_complete(&self) {
+        self.capture_generation.fetch_add(1, Ordering::AcqRel);
+        self.notify_damage();
+    }
 }
 
 #[cfg(test)]
@@ -697,6 +711,9 @@ mod tests {
         fb.request_full_capture();
         assert!(fb.take_full_capture_request());
         assert!(!fb.take_full_capture_request());
+        assert_eq!(fb.capture_generation(), 0);
+        fb.note_capture_complete();
+        assert_eq!(fb.capture_generation(), 1);
     }
 
     #[test]
