@@ -98,8 +98,15 @@ impl X11CaptureEngine {
         fps: u32,
         cancel_token: CancellationToken,
     ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-        tokio::spawn(async move {
-            self.run_capture_loop(framebuffer, fps, cancel_token).await
+        // Run the whole capture pipeline on the blocking thread-pool so the
+        // heavy shm copy + FNV hashing never starve the async RFB workers.
+        tokio::task::spawn_blocking(move || {
+            // Dedicated single-thread runtime for the blocking capture loop.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build capture runtime");
+            rt.block_on(self.run_capture_loop(framebuffer, fps, cancel_token))
         })
     }
 
