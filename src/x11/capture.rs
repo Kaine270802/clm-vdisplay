@@ -319,11 +319,11 @@ impl X11CaptureEngine {
                             continue;
                         }
 
-                        // Enforce the fps cap between captures.
+                        // Enforce the fps cap between *successful* captures.
+                        // Failed grabs must not consume a frame slot.
                         if last_capture.elapsed() < frame_pacing {
                             continue;
                         }
-                        last_capture = Instant::now();
                         // Activity detected: keep polling fast for low latency.
                         idle_poll = IDLE_POLL_MIN;
 
@@ -444,6 +444,7 @@ impl X11CaptureEngine {
                         // waiting for XDamage (static screen => empty FB).
                         if capture_succeeded {
                             needs_capture = false;
+                            last_capture = Instant::now();
                         } else {
                             needs_capture = true;
                         }
