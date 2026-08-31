@@ -150,7 +150,7 @@ impl DisplaySession {
         self.capture_fps.store(fps, Ordering::Relaxed);
     }
 
-    /// Test / daemon helper: clamp to live slider range 1..=30 and store.
+    /// Test / daemon helper: clamp to live Max FPS range 1..=120 and store.
     pub fn apply_live_fps(&self, fps: u32) -> u32 {
         let clamped = crate::rfb::message::clamp_live_fps(fps);
         self.capture_fps.store(clamped, Ordering::Relaxed);

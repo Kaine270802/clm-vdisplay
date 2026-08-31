@@ -11,7 +11,7 @@ This README matches the behavior of this tree. Marketing numbers that are not me
 - Supervises **Xvfb** (`--manage-x11`) with MIT-SHM + XDamage capture.
 - Speaks RFB 3.8 to noVNC / Tight clients: **Tight (zlib lossless)** → ZRLE → RAW.
 - Injects **mouse and keyboard** into X11 with **XTest** (must finish attaching before RFB input; fire-and-forget injector was a past bug).
-- Caps capture with `--fps` (CLI default **60**; **Gateway Space passes `--fps 15`**). Live change: RFB client message **SetFps** (type **254**, 4 bytes: `u8 type`, `u8 pad=0`, `u16 fps` big-endian) on the open `/vnc/{browserId}` socket of the **`start` process**. Capture loop reads an `AtomicU32` each wait (min 1). Stored live value is clamped to **1..=30** (slider range). Display (`vnc.html`) sends type 254; do not restart RFB.
+- Caps capture with `--fps` (CLI default **60**; **Gateway Space passes `--fps 15`**). Live change: RFB client message **SetFps** (type **254**, 4 bytes: `u8 type`, `u8 pad=0`, `u16 fps` big-endian) on the open `/vnc/{browserId}` socket of the **`start` process**. Capture loop reads an `AtomicU32` each wait (min 1). Stored live value is clamped to **1..=120** (`vnc.html` Max FPS presets 15 / 30 / 60 / 120). Display sends type 254; do not restart RFB.
 - Two-way **text** clipboard: RFB `ClientCutText` → X11 **CLIPBOARD** and **PRIMARY** (XFixes / ICCCM owner) so Chrome Ctrl+V works; XFixes `SelectionNotify` on CLIPBOARD → `ServerCutText`. Applied text is capped at **256 KiB** (truncate + log; RFB session stays up). Parse ceiling 10 MiB is unchanged. Images/files are not supported.
 - Optional Prometheus `--metrics-port` (`/health`, `/metrics`). Gateway spawn **does not** pass `--metrics-port`.
 

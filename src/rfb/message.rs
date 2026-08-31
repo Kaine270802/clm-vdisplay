@@ -42,9 +42,10 @@ pub const CLIENT_MSG_ENABLE_CONTINUOUS_UPDATES: u8 = 150;
 /// Live capture FPS on the RFB session (Display vnc.html sends this; 4 bytes).
 pub const CLIENT_MSG_SET_FPS: u8 = 254;
 
-/// Slider range for live SetFps. Initial `--fps` (CLI default 60) is not clamped.
+/// Live SetFps clamp (vnc.html Max FPS presets: 15, 30, 60, 120).
+/// Initial `--fps` (CLI default 60) is not clamped at spawn.
 pub const LIVE_FPS_MIN: u32 = 1;
-pub const LIVE_FPS_MAX: u32 = 30;
+pub const LIVE_FPS_MAX: u32 = 120;
 
 pub fn clamp_live_fps(fps: u32) -> u32 {
     fps.clamp(LIVE_FPS_MIN, LIVE_FPS_MAX)
@@ -512,13 +513,14 @@ mod tests {
     }
 
     #[test]
-    fn test_clamp_live_fps_slider_range() {
+    fn test_clamp_live_fps_max_range() {
         assert_eq!(clamp_live_fps(0), 1);
         assert_eq!(clamp_live_fps(1), 1);
         assert_eq!(clamp_live_fps(15), 15);
         assert_eq!(clamp_live_fps(30), 30);
-        assert_eq!(clamp_live_fps(31), 30);
-        assert_eq!(clamp_live_fps(60), 30);
-        assert_eq!(clamp_live_fps(u32::MAX), 30);
+        assert_eq!(clamp_live_fps(60), 60);
+        assert_eq!(clamp_live_fps(120), 120);
+        assert_eq!(clamp_live_fps(121), 120);
+        assert_eq!(clamp_live_fps(u32::MAX), 120);
     }
 }

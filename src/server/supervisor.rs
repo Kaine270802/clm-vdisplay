@@ -489,13 +489,15 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
-        assert_eq!(session.apply_live_fps(60), 30);
+        assert_eq!(session.apply_live_fps(60), 60);
         assert_eq!(
             session
                 .capture_fps
                 .load(std::sync::atomic::Ordering::Relaxed),
-            30
+            60
         );
+        assert_eq!(session.apply_live_fps(120), 120);
+        assert_eq!(session.apply_live_fps(121), 120);
         assert_eq!(clamp_live_fps(15), 15);
         assert_eq!(session.apply_live_fps(15), 15);
     }
