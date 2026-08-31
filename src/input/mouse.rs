@@ -55,7 +55,9 @@ impl Default for MouseRouter {
 
 impl MouseRouter {
     pub fn new() -> Self {
-        let (event_tx, _) = broadcast::channel(256);
+        // Trackpads (MacBook) emit PointerEvent bursts well above 256/s; a
+        // small broadcast buffer Lagged the injector and froze remote hover.
+        let (event_tx, _) = broadcast::channel(2048);
         Self {
             state: Arc::new(RwLock::new(MouseState::default())),
             event_tx,

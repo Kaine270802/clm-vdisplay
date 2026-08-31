@@ -245,7 +245,14 @@ impl X11InputInjector {
             loop {
                 tokio::select! {
                     _ = cancel_mouse.cancelled() => break,
-                    Ok(action) = mouse_rx.recv() => {
+                    result = mouse_rx.recv() => {
+                        let action = match result {
+                            Ok(action) => action,
+                            // Fast MacBook-trackpad motion can overrun the
+                            // broadcast buffer; skip the burst and keep injecting.
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        };
                         match action {
                             MouseAction::Move { x, y } => {
                                 let _ = injector_mouse.conn.xtest_fake_input(
@@ -295,8 +302,14 @@ impl X11InputInjector {
             loop {
                 tokio::select! {
                     _ = cancel_kb.cancelled() => break,
-                    Ok(KeyAction { down, key_sym, .. }) = kb_rx.recv() => {
-                        let _ = injector_kb.send_key_event(key_sym, down);
+                    result = kb_rx.recv() => {
+                        match result {
+                            Ok(KeyAction { down, key_sym, .. }) => {
+                                let _ = injector_kb.send_key_event(key_sym, down);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
                     }
                 }
             }
