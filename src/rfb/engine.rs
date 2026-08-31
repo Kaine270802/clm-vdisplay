@@ -206,6 +206,10 @@ impl RfbProtocolEngine {
             ServerMessage::server_init(width, height, &default_format, &self.desktop_name);
         self.transport.send_bytes(&server_init_bytes).await?;
 
+        // Recapture the full screen so a newly connected client does not
+        // inherit an empty framebuffer if the first grab failed or ran too early.
+        self.framebuffer.request_full_capture();
+
         // 5. Client Event & Streaming Loop
         let mut client_format = default_format;
         let mut _client_encodings: Vec<i32> = Vec::new();

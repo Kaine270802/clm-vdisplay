@@ -301,6 +301,9 @@ impl X11CaptureEngine {
                         }
 
                         // C. Decide whether a capture is due.
+                        if framebuffer.take_full_capture_request() {
+                            needs_capture = true;
+                        }
                         if damage_id.is_none() {
                             // Fallback: tick-based polling at the requested fps.
                             needs_capture = true;
@@ -321,7 +324,6 @@ impl X11CaptureEngine {
                             continue;
                         }
                         last_capture = Instant::now();
-                        needs_capture = false;
                         // Activity detected: keep polling fast for low latency.
                         idle_poll = IDLE_POLL_MIN;
 
@@ -410,6 +412,7 @@ impl X11CaptureEngine {
                                         if has_changes {
                                             framebuffer.notify_damage();
                                         }
+                                        capture_succeeded = true;
                                         consecutive_errors = 0;
                                     }
                                     Err(e) => {
@@ -434,6 +437,15 @@ impl X11CaptureEngine {
                                     }
                                 }
                             }
+                        }
+
+                        // Only drop needs_capture after a successful grab. A
+                        // failed/too-early first capture must retry without
+                        // waiting for XDamage (static screen => empty FB).
+                        if capture_succeeded {
+                            needs_capture = false;
+                        } else {
+                            needs_capture = true;
                         }
 
                         // E. X11 connection broken -> reconnect.

@@ -1,6 +1,6 @@
 use parking_lot::RwLock;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -650,6 +650,9 @@ pub struct SharedFramebuffer {
     pub notify_tx: watch::Sender<u64>,
     pub notify_rx: watch::Receiver<u64>,
     frame_counter: Arc<AtomicU64>,
+    /// Set by RFB clients (and at construction) to force a full-screen grab
+    /// before the capture loop waits on XDamage.
+    full_capture_requested: Arc<AtomicBool>,
 }
 
 impl SharedFramebuffer {
@@ -661,6 +664,7 @@ impl SharedFramebuffer {
             notify_tx,
             notify_rx,
             frame_counter: Arc::new(AtomicU64::new(1)),
+            full_capture_requested: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -668,11 +672,32 @@ impl SharedFramebuffer {
         let v = self.frame_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let _ = self.notify_tx.send(v);
     }
+
+    /// Request a full-screen capture on the next capture-loop tick.
+    pub fn request_full_capture(&self) {
+        self.full_capture_requested.store(true, Ordering::Release);
+    }
+
+    /// Consume a pending full-capture request. Returns true if a grab is due.
+    pub fn take_full_capture_request(&self) -> bool {
+        self.full_capture_requested.swap(false, Ordering::AcqRel)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_full_capture_request_flag() {
+        let fb = SharedFramebuffer::new(64, 64);
+        // Construction requests an initial full-screen grab.
+        assert!(fb.take_full_capture_request());
+        assert!(!fb.take_full_capture_request());
+        fb.request_full_capture();
+        assert!(fb.take_full_capture_request());
+        assert!(!fb.take_full_capture_request());
+    }
 
     #[test]
     fn test_rect_intersection() {
