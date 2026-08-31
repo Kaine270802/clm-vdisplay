@@ -2,13 +2,13 @@ use crate::display::framebuffer::SharedFramebuffer;
 use crate::x11::shm::ShmSegment;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use tokio::time::{interval, MissedTickBehavior};
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use x11rb::connection::Connection;
+use x11rb::protocol::damage::{self, ConnectionExt as DamageConnectionExt};
 use x11rb::protocol::shm::ConnectionExt as _;
-use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
+use x11rb::protocol::xproto::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
 /// Bounding rectangle for accumulated damaged screen regions
@@ -75,12 +75,21 @@ impl DirtyTracker {
     }
 }
 
-/// High-performance X11 Zero-Copy Framebuffer Capture Engine (MIT-SHM + xproto fallback)
+/// High-performance X11 Zero-Copy Framebuffer Capture Engine.
+///
+/// Damage-event-driven: XDamage extension reports which regions changed, so
+/// full-frame copies only happen when the screen actually changed (near-zero
+/// CPU when idle). Falls back to tick-based polling if XDamage is unavailable.
 pub struct X11CaptureEngine {
     pub display_num: u32,
     pub width: u32,
     pub height: u32,
 }
+
+/// Maximum interval between event-queue polls when the screen is idle.
+const IDLE_POLL_MAX: Duration = Duration::from_millis(25);
+/// Minimum interval between event-queue polls (keeps CPU near zero when idle).
+const IDLE_POLL_MIN: Duration = Duration::from_millis(2);
 
 impl X11CaptureEngine {
     pub fn new(display_num: u32, width: u32, height: u32) -> Self {
@@ -110,7 +119,8 @@ impl X11CaptureEngine {
         })
     }
 
-    /// Connect to X11 server and run MIT-SHM capture pipeline with xproto fallback and auto-reconnect
+    /// Connect to X11 server and run a damage-event-driven MIT-SHM capture
+    /// pipeline with xproto fallback, adaptive idle polling, and auto-reconnect.
     pub async fn run_capture_loop(
         self,
         framebuffer: SharedFramebuffer,
@@ -118,15 +128,14 @@ impl X11CaptureEngine {
         cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
         let display_str = format!(":{}", self.display_num);
-        let frame_pacing_nanos = (1_000_000_000u64 / (fps.max(1) as u64)).max(1_000_000);
-        let mut tick_timer = interval(Duration::from_nanos(frame_pacing_nanos));
-        tick_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // Minimum spacing between captures (fps cap).
+        let frame_pacing = Duration::from_nanos((1_000_000_000u64 / (fps.max(1) as u64)).max(1_000_000));
 
         info!(
-            "X11CaptureEngine started at {} FPS (interval: {:?}) for display {}",
-            fps,
-            Duration::from_nanos(frame_pacing_nanos),
-            display_str
+            "X11CaptureEngine (damage-event-driven) started for display {} (fps cap {}, pacing {:?})",
+            display_str,
+            fps.max(1),
+            frame_pacing
         );
 
         while !cancel_token.is_cancelled() {
@@ -195,8 +204,53 @@ impl X11CaptureEngine {
                 }
             };
 
+            // 3. Register XDamage on the root window (NON_EMPTY => single
+            //    bounding-box event per change burst; cheapest event level).
+            let damage_id: Option<u32> = match conn.damage_query_version(0, 0) {
+                Ok(cookie) => match cookie.reply() {
+                    Ok(ver) => {
+                        let id = conn.generate_id()?;
+                        match conn.damage_create(id, root, damage::ReportLevel::NON_EMPTY) {
+                            Ok(_) => {
+                                info!(
+                                    "XDamage registered on {} (v{}.{}), switching to event-driven capture",
+                                    display_str, ver.major_version, ver.minor_version
+                                );
+                                Some(id)
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "damage_create failed on {} ({}), falling back to tick polling",
+                                    display_str, e
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "damage_query_version reply failed on {}: {}, falling back to tick polling",
+                            display_str, e
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        "damage_query_version request failed on {}: {}, falling back to tick polling",
+                        display_str, e
+                    );
+                    None
+                }
+            };
+
             let mut consecutive_errors: u32 = 0;
-            let mut last_warn_time = std::time::Instant::now();
+            let mut last_warn_time = Instant::now();
+            // First frame is always captured immediately so clients see content
+            // even while the screen stays static.
+            let mut needs_capture = true;
+            let mut last_capture = Instant::now() - frame_pacing;
+            let mut idle_poll = IDLE_POLL_MIN;
 
             loop {
                 tokio::select! {
@@ -207,10 +261,72 @@ impl X11CaptureEngine {
                         }
                         return Ok(());
                     }
-                    _ = tick_timer.tick() => {
-                        let mut capture_succeeded = false;
+                    _ = tokio::time::sleep(idle_poll) => {
+                        // A. Drain pending damage events (cheap: non-blocking
+                        //    read of the socket event queue).
+                        let dirty = DirtyTracker::new();
+                        let mut events_drained = 0usize;
+                        let mut drain_broken = false;
+                        while events_drained < 256 {
+                            match conn.poll_for_event() {
+                                Ok(Some(ev)) => {
+                                    events_drained += 1;
+                                    if let x11rb::protocol::Event::DamageNotify(dn) = ev {
+                                        let area = dn.area;
+                                        if area.width > 0 && area.height > 0 {
+                                            let x = if area.x >= 0 { area.x as u16 } else { 0 };
+                                            let y = if area.y >= 0 { area.y as u16 } else { 0 };
+                                            dirty.mark_dirty_rect(x, y, area.width, area.height);
+                                        }
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(_) => {
+                                    drain_broken = true;
+                                    break;
+                                }
+                            }
+                        }
 
-                        // Primary capture path: MIT-SHM DMA from X11 root window
+                        if drain_broken {
+                            consecutive_errors = consecutive_errors.saturating_add(1);
+                        }
+
+                        // B. Reset the accumulated damage region on the server.
+                        // Region 0 = None (reset toàn bộ, không repair).
+                        if let Some(d) = damage_id {
+                            if events_drained > 0 {
+                                let _ = conn.damage_subtract(d, 0u32, 0u32);
+                            }
+                        }
+
+                        // C. Decide whether a capture is due.
+                        if damage_id.is_none() {
+                            // Fallback: tick-based polling at the requested fps.
+                            needs_capture = true;
+                        }
+                        if events_drained > 0 {
+                            needs_capture = true;
+                        }
+
+                        if !needs_capture {
+                            // Screen static: back the poll interval off toward
+                            // IDLE_POLL_MAX so idle CPU cost stays near zero.
+                            idle_poll = (idle_poll.saturating_mul(2)).min(IDLE_POLL_MAX);
+                            continue;
+                        }
+
+                        // Enforce the fps cap between captures.
+                        if last_capture.elapsed() < frame_pacing {
+                            continue;
+                        }
+                        last_capture = Instant::now();
+                        needs_capture = false;
+                        // Activity detected: keep polling fast for low latency.
+                        idle_poll = IDLE_POLL_MIN;
+
+                        // D. Capture (MIT-SHM primary path, xproto fallback).
+                        let mut capture_succeeded = false;
                         if let Some(ref shm) = shm_segment {
                             let cookie = conn.shm_get_image(
                                 root,
@@ -219,11 +335,10 @@ impl X11CaptureEngine {
                                 self.width as u16,
                                 self.height as u16,
                                 !0,
-                                ImageFormat::Z_PIXMAP.into(),
+                                x11rb::protocol::xproto::ImageFormat::Z_PIXMAP.into(),
                                 shm.shmseg,
                                 0,
                             );
-
                             match cookie {
                                 Ok(reply_cookie) => match reply_cookie.reply() {
                                     Ok(_) => {
@@ -252,7 +367,7 @@ impl X11CaptureEngine {
                                                 "XShmGetImage reply error on display {}: {}, falling back to xproto",
                                                 display_str, e
                                             );
-                                            last_warn_time = std::time::Instant::now();
+                                            last_warn_time = Instant::now();
                                         }
                                     }
                                 },
@@ -263,16 +378,15 @@ impl X11CaptureEngine {
                                             "XShmGetImage request error on display {}: {}, falling back to xproto",
                                             display_str, e
                                         );
-                                        last_warn_time = std::time::Instant::now();
+                                        last_warn_time = Instant::now();
                                     }
                                 }
                             }
                         }
 
-                        // Fallback capture path: standard xproto get_image
                         if !capture_succeeded {
                             match conn.get_image(
-                                ImageFormat::Z_PIXMAP,
+                                x11rb::protocol::xproto::ImageFormat::Z_PIXMAP,
                                 root,
                                 0,
                                 0,
@@ -305,7 +419,7 @@ impl X11CaptureEngine {
                                                 "xproto get_image reply error on display {}: {}",
                                                 display_str, e
                                             );
-                                            last_warn_time = std::time::Instant::now();
+                                            last_warn_time = Instant::now();
                                         }
                                     }
                                 },
@@ -316,14 +430,14 @@ impl X11CaptureEngine {
                                             "xproto get_image request error on display {}: {}",
                                             display_str, e
                                         );
-                                        last_warn_time = std::time::Instant::now();
+                                        last_warn_time = Instant::now();
                                     }
                                 }
                             }
                         }
 
-                        // If X11 connection repeatedly fails (e.g. X server restarted or socket broken), reconnect
-                        if consecutive_errors >= (fps.max(1) * 2) {
+                        // E. X11 connection broken -> reconnect.
+                        if consecutive_errors >= (fps.max(1) * 2).max(8) {
                             warn!(
                                 "X11 connection broken on {} ({} consecutive errors), reconnecting...",
                                 display_str, consecutive_errors

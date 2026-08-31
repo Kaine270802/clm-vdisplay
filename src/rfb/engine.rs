@@ -361,8 +361,8 @@ async fn send_framebuffer_update_stream(
     send_buf: &mut BytesMut,
     framebuffer: &SharedFramebuffer,
     client_format: &PixelFormat,
-    _supports_tight: bool,
-    _supports_zrle: bool,
+    supports_tight: bool,
+    supports_zrle: bool,
     supports_last_rect: bool,
     supports_desktop_size: bool,
     client_width: &mut u16,
@@ -433,10 +433,19 @@ async fn send_framebuffer_update_stream(
             *client_height = current_height;
         }
 
-        for rect in &filtered_rects {
-            // Default to high-performance RAW stream with tile damage tracking:
-            // delivers zero-copy byte alignment without zlib stream state desync.
-            encode_raw_rect(&fb_guard, rect, client_format, send_buf);
+        // Chọn encoder theo capability client: Tight > ZRLE > RAW (fallback an toàn)
+        if supports_tight {
+            for rect in &filtered_rects {
+                encode_tight_rect(&fb_guard, rect, client_format, send_buf);
+            }
+        } else if supports_zrle {
+            for rect in &filtered_rects {
+                encode_zrle_rect(&fb_guard, rect, client_format, send_buf);
+            }
+        } else {
+            for rect in &filtered_rects {
+                encode_raw_rect(&fb_guard, rect, client_format, send_buf);
+            }
         }
 
         if supports_last_rect {
