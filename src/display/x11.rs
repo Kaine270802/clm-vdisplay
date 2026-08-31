@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// High-level Headless X11 Server integration managing supervisor, capture, and input
 pub struct HeadlessX11Server {
@@ -84,26 +84,32 @@ impl HeadlessX11Server {
             }
         });
 
-        // 3. Connect XTest input injector in background
+        // 3. Connect XTest input injector BEFORE returning. Session start
+        //    attaches InputRouter immediately after initialize(); a fire-and-
+        //    forget spawn left get_input_injector() as None, so broadcast
+        //    PointerEvent/KeyEvent had zero subscribers and XTest never ran.
         let display_num = self.display_num;
-        let input_inj_slot = self.input_injector.clone();
-        tokio::spawn(async move {
-            match X11InputInjector::new(display_num) {
-                Ok(injector) => {
-                    *input_inj_slot.lock() = Some(Arc::new(injector));
-                    info!(
-                        "XTest input injector initialized on display :{}",
-                        display_num
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to initialize XTest input injector on display :{}: {}",
-                        display_num, e
-                    );
-                }
+        match tokio::task::spawn_blocking(move || X11InputInjector::new(display_num)).await {
+            Ok(Ok(injector)) => {
+                *self.input_injector.lock() = Some(Arc::new(injector));
+                info!(
+                    "XTest input injector initialized on display :{}",
+                    display_num
+                );
             }
-        });
+            Ok(Err(e)) => {
+                error!(
+                    "Failed to initialize XTest input injector on display :{}: {}",
+                    display_num, e
+                );
+            }
+            Err(e) => {
+                error!(
+                    "XTest input injector task panicked on display :{}: {}",
+                    display_num, e
+                );
+            }
+        }
 
         Ok(())
     }

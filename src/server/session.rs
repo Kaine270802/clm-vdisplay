@@ -157,6 +157,15 @@ impl DisplaySession {
 
             if let Some(injector) = x11.get_input_injector() {
                 injector.attach_input_router(&self.input_router, self.cancel_token.child_token());
+                info!(
+                    "XTest input injector attached to InputRouter on display :{}",
+                    self.config.display_num
+                );
+            } else {
+                error!(
+                    "XTest input injector unavailable on display :{}; RFB PointerEvent/KeyEvent will not reach Xvfb",
+                    self.config.display_num
+                );
             }
 
             info!(
