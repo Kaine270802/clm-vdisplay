@@ -68,11 +68,44 @@ fn bench_tight_encoder_1080p(c: &mut Criterion) {
     });
 }
 
+fn bench_color_conversion_tile_64(c: &mut Criterion) {
+    let fb = TileFramebuffer::new(1920, 1080);
+    let rect = Rect::new(0, 0, 64, 64);
+    let rgb24_fmt = PixelFormat::rgb24();
+    let mut out = vec![0u8; 64 * 64 * 3];
+
+    c.bench_function("color_conversion_bgra_to_rgb24_tile_64", |b| {
+        b.iter(|| {
+            fb.extract_rect_bytes_into(&rect, &rgb24_fmt, &mut out);
+            black_box(&out[..10]);
+        })
+    });
+}
+
+fn bench_tight_encoder_tile_64_noisy(c: &mut Criterion) {
+    let mut fb = TileFramebuffer::new(1920, 1080);
+    let patch: Vec<u8> = (0..(64 * 64 * 4)).map(|i| (i % 251) as u8).collect();
+    fb.update_rect(0, 0, 64, 64, &patch, 64 * 4);
+    let rect = Rect::new(0, 0, 64, 64);
+    let format = PixelFormat::bgra32();
+    let mut buf = BytesMut::with_capacity(64 * 64 * 4);
+
+    c.bench_function("tight_encode_tile_64_noisy", |b| {
+        b.iter(|| {
+            buf.clear();
+            encode_tight_rect(&fb, &rect, &format, &mut buf);
+            black_box(buf.len());
+        })
+    });
+}
+
 criterion_group!(
     benches,
     bench_framebuffer_1080p_damage,
     bench_color_conversion_1080p_rayon,
     bench_color_conversion_1440p_rayon,
-    bench_tight_encoder_1080p
+    bench_tight_encoder_1080p,
+    bench_color_conversion_tile_64,
+    bench_tight_encoder_tile_64_noisy
 );
 criterion_main!(benches);

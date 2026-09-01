@@ -430,8 +430,10 @@ impl TileFramebuffer {
             && target_format.red_shift == 16
             && target_format.blue_shift == 0;
 
-        // Use parallel rayon scanlines if area is large enough (>= 16 rows)
-        if rh >= 16 {
+        // Parallel only when the copy is large enough that fork/join pays off
+        // on 2 vCPU. 64×64 tiles (16 KiB BGRA / 12 KiB RGB24) stay serial.
+        const RAYON_MIN_BYTES: usize = 65_536;
+        if rh * dst_stride >= RAYON_MIN_BYTES {
             out.par_chunks_exact_mut(dst_stride)
                 .take(rh)
                 .enumerate()
