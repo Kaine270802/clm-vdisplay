@@ -1,4 +1,5 @@
 use crate::display::framebuffer::SharedFramebuffer;
+use crate::metrics::GLOBAL_METRICS;
 use crate::x11::shm::ShmSegment;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -104,6 +105,13 @@ pub fn remaining_pacing(elapsed: Duration, pacing: Duration) -> Duration {
 
 fn load_fps(fps: &AtomicU32) -> u32 {
     fps.load(Ordering::Relaxed).max(1)
+}
+
+/// Full-frame SHM grab is only useful while an RFB client is attached.
+/// Drain/XDamage still run when this returns false; `needs_capture` is left set.
+#[inline]
+pub fn grab_while_clients_attached(active_connections: u64) -> bool {
+    active_connections > 0
 }
 
 impl X11CaptureEngine {
@@ -331,6 +339,16 @@ impl X11CaptureEngine {
                             continue;
                         }
 
+                        // No viewer: skip shm_get_image. Keep needs_capture so a
+                        // newly attached client grabs on the next tick. Back off
+                        // toward IDLE_POLL_MAX (not IDLE_POLL_MIN).
+                        if !grab_while_clients_attached(
+                            GLOBAL_METRICS.active_connections.load(Ordering::Relaxed),
+                        ) {
+                            idle_poll = (idle_poll.saturating_mul(2)).min(IDLE_POLL_MAX);
+                            continue;
+                        }
+
                         // Enforce the fps cap between *successful* captures.
                         // Failed grabs must not consume a frame slot.
                         // Recompute from the live atomic each wait (SetFps / --fps seed).
@@ -368,7 +386,7 @@ impl X11CaptureEngine {
                                 Ok(reply_cookie) => match reply_cookie.reply() {
                                     Ok(_) => {
                                         let raw_slice = shm.as_slice();
-                                        let has_changes = {
+                                        {
                                             let mut fb = framebuffer.inner.write();
                                             fb.update_rect_from_full_frame(
                                                 0,
@@ -377,10 +395,6 @@ impl X11CaptureEngine {
                                                 self.height,
                                                 raw_slice,
                                             );
-                                            fb.has_dirty_tiles()
-                                        };
-                                        if has_changes {
-                                            framebuffer.notify_damage();
                                         }
                                         capture_succeeded = true;
                                         consecutive_errors = 0;
@@ -421,7 +435,7 @@ impl X11CaptureEngine {
                             ) {
                                 Ok(cookie) => match cookie.reply() {
                                     Ok(reply) => {
-                                        let has_changes = {
+                                        {
                                             let mut fb = framebuffer.inner.write();
                                             fb.update_rect_from_full_frame(
                                                 0,
@@ -430,10 +444,6 @@ impl X11CaptureEngine {
                                                 self.height,
                                                 &reply.data,
                                             );
-                                            fb.has_dirty_tiles()
-                                        };
-                                        if has_changes {
-                                            framebuffer.notify_damage();
                                         }
                                         capture_succeeded = true;
                                         consecutive_errors = 0;
@@ -584,5 +594,12 @@ mod tests {
         // identity: remaining + elapsed == pacing when elapsed < pacing
         assert_eq!(rem + elapsed, pacing);
         assert_eq!(r0 + Duration::ZERO, pacing_15);
+    }
+
+    #[test]
+    fn test_grab_while_clients_attached() {
+        assert!(!grab_while_clients_attached(0));
+        assert!(grab_while_clients_attached(1));
+        assert!(grab_while_clients_attached(2));
     }
 }
