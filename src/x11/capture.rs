@@ -97,6 +97,11 @@ pub fn frame_pacing_from_fps(fps: u32) -> Duration {
     Duration::from_nanos((1_000_000_000u64 / (fps.max(1) as u64)).max(1_000_000))
 }
 
+/// Time left until the next grab is allowed. Zero if `elapsed` already meets `pacing`.
+pub fn remaining_pacing(elapsed: Duration, pacing: Duration) -> Duration {
+    pacing.saturating_sub(elapsed)
+}
+
 fn load_fps(fps: &AtomicU32) -> u32 {
     fps.load(Ordering::Relaxed).max(1)
 }
@@ -331,10 +336,18 @@ impl X11CaptureEngine {
                         // Recompute from the live atomic each wait (SetFps / --fps seed).
                         let fps_now = load_fps(&fps);
                         let frame_pacing = frame_pacing_from_fps(fps_now);
-                        if last_capture.elapsed() < frame_pacing {
+                        let remaining = remaining_pacing(last_capture.elapsed(), frame_pacing);
+                        if remaining > Duration::ZERO {
+                            // Sleep the pacing remainder (not IDLE_POLL_MIN).
+                            // Do not clamp to IDLE_POLL_MAX — that would still wake ~40 Hz.
+                            // Do not stamp last_capture; after this select sleep we
+                            // drain XDamage, re-load the FPS atomic, and re-check
+                            // against the new pacing (SetFps 15↔30 during the wait).
+                            idle_poll = remaining;
                             continue;
                         }
-                        // Activity detected: keep polling fast for low latency.
+                        // Slot open: grab, then restore fast poll for the next
+                        // damage burst. last_capture is stamped only on success.
                         idle_poll = IDLE_POLL_MIN;
 
                         // D. Capture (MIT-SHM primary path, xproto fallback).
@@ -540,5 +553,36 @@ mod tests {
         fps.store(0, Ordering::Relaxed);
         let pmin = frame_pacing_from_fps(load_fps(&fps));
         assert_eq!(pmin, Duration::from_nanos(1_000_000_000));
+    }
+
+    #[test]
+    fn test_frame_pacing_from_fps_15() {
+        assert_eq!(
+            frame_pacing_from_fps(15),
+            Duration::from_nanos(1_000_000_000 / 15)
+        );
+    }
+
+    #[test]
+    fn test_remaining_pacing() {
+        let pacing_15 = frame_pacing_from_fps(15);
+        let r0 = remaining_pacing(Duration::ZERO, pacing_15);
+        assert_eq!(r0, pacing_15);
+        assert_eq!(r0, Duration::from_nanos(1_000_000_000 / 15));
+
+        assert_eq!(remaining_pacing(pacing_15, pacing_15), Duration::ZERO);
+        assert_eq!(
+            remaining_pacing(pacing_15 + Duration::from_millis(1), pacing_15),
+            Duration::ZERO
+        );
+
+        let elapsed = Duration::from_millis(10);
+        let pacing = Duration::from_millis(33);
+        let rem = remaining_pacing(elapsed, pacing);
+        assert_eq!(rem, Duration::from_millis(23));
+
+        // identity: remaining + elapsed == pacing when elapsed < pacing
+        assert_eq!(rem + elapsed, pacing);
+        assert_eq!(r0 + Duration::ZERO, pacing_15);
     }
 }
